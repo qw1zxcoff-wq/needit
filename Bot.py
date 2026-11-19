@@ -18,16 +18,33 @@ COOLDOWN = 20
 
 VOWELS = "aeiou"
 CONS = "bcdfghjklmnpqrstvwxz"
-PATTERNS = ["CVCVC", "CVCCV", "CCVCV", "VCVCV", "CVVCV", "VCCVC"]
+PATTERNS = {
+    5: ["CVCVC", "CVCCV", "CCVCV", "VCVCV", "CVVCV", "VCCVC"],
+    6: ["CVCVCV", "CVCCVC", "CCVCVC", "VCVCVC", "CVVCVC", "VCCVCV"],
+}
+
+KEYBOARD = {
+    "inline_keyboard": [
+        [
+            {"text": "5 букв · красивые", "callback_data": "find:5"},
+            {"text": "6 букв · красивые", "callback_data": "find:6"},
+        ],
+        [
+            {"text": "5 букв · случайные", "callback_data": "rand:5"},
+            {"text": "6 букв · случайные", "callback_data": "rand:6"},
+        ],
+    ]
+}
 
 busy = set()
 last_run = {}
 
 HELP = (
-    "Ищу свободные 5-буквенные юзернеймы.\n\n"
-    "/find [N] - красивые (читаемые)\n"
-    "/random [N] - полностью случайные\n"
+    "Ищу свободные юзернеймы из 5 или 6 букв. Выбери кнопкой или командой:\n\n"
+    "/find [5|6] [N] - красивые (читаемые)\n"
+    "/random [5|6] [N] - полностью случайные\n"
     "/check имя - проверить конкретный юз\n\n"
+    "Пример: /find 6 30 - 30 красивых по 6 букв.\n"
     "N - сколько проверить (до %d, по умолчанию %d).\n"
     "Пометка «свободен?» не гарантия: юз может быть зарезервирован или на Fragment."
     % (MAX_N, DEFAULT_N)
@@ -43,20 +60,21 @@ def api(method, **params):
         return json.loads(r.read().decode("utf-8"))
 
 
-def send(chat_id, text):
+def send(chat_id, text, markup=None):
+    params = {"chat_id": chat_id, "text": text}
+    if markup:
+        params["reply_markup"] = markup
     try:
-        api("sendMessage", chat_id=chat_id, text=text)
+        api("sendMessage", **params)
     except Exception as e:
-        print("send error:", e)
+        print("send error:", e, flush=True)
 
 
-def gen_pronounceable():
-    p = random.choice(PATTERNS)
+def gen_name(kind, length):
+    if kind == "rand":
+        return "".join(random.choice(string.ascii_lowercase) for _ in range(length))
+    p = random.choice(PATTERNS[length])
     return "".join(random.choice(CONS if c == "C" else VOWELS) for c in p)
-
-
-def gen_random():
-    return "".join(random.choice(string.ascii_lowercase) for _ in range(5))
 
 
 def check(name):
@@ -77,12 +95,12 @@ def check(name):
     return "tgme_page_title" not in html
 
 
-def search(chat_id, gen, n):
+def search(chat_id, kind, length, n):
     try:
-        send(chat_id, "Проверяю %d юзов, подожди ~%d сек..." % (n, int(n * DELAY)))
+        send(chat_id, "Проверяю %d юзов по %d букв, подожди ~%d сек..." % (n, length, int(n * DELAY)))
         found, seen, errors, done = [], set(), 0, 0
         while done < n and errors < 5:
-            name = gen()
+            name = gen_name(kind, length)
             if name in seen:
                 continue
             seen.add(name)
@@ -97,19 +115,40 @@ def search(chat_id, gen, n):
                 found.append("@" + name)
             time.sleep(DELAY)
         if found:
-            send(chat_id, "Похоже свободны (%d из %d):\n%s" % (len(found), done, "\n".join(found)))
+            text = "Похоже свободны (%d из %d):\n%s" % (len(found), done, "\n".join(found))
         else:
-            send(chat_id, "Проверено %d, свободных не нашлось. Попробуй ещё раз." % done)
+            text = "Проверено %d, свободных не нашлось. Попробуй ещё раз." % done
         if errors >= 5:
-            send(chat_id, "t.me часто не отвечает, остановился. Попробуй позже.")
+            text += "\n\nt.me часто не отвечает, остановился. Попробуй позже."
+        send(chat_id, text, KEYBOARD)
     finally:
         busy.discard(chat_id)
 
 
-def parse_n(parts):
-    if len(parts) > 1 and parts[1].isdigit():
-        return max(1, min(int(parts[1]), MAX_N))
-    return DEFAULT_N
+def start_search(chat_id, kind, length, n):
+    if chat_id in busy:
+        send(chat_id, "Поиск уже идёт, дождись результата.")
+        return
+    wait = COOLDOWN - (time.time() - last_run.get(chat_id, 0))
+    if wait > 0:
+        send(chat_id, "Подожди ещё %d сек." % int(wait))
+        return
+    last_run[chat_id] = time.time()
+    busy.add(chat_id)
+    threading.Thread(target=search, args=(chat_id, kind, length, n), daemon=True).start()
+
+
+def parse_args(parts):
+    """/find [5|6] [N] -> (длина, N)"""
+    args = parts[1:]
+    length = 5
+    n = DEFAULT_N
+    if args and args[0] in ("5", "6"):
+        length = int(args[0])
+        args = args[1:]
+    if args and args[0].isdigit():
+        n = max(1, min(int(args[0]), MAX_N))
+    return length, n
 
 
 def handle(msg):
@@ -121,12 +160,12 @@ def handle(msg):
     cmd = parts[0].split("@")[0].lower()
 
     if cmd in ("/start", "/help"):
-        send(chat_id, HELP)
+        send(chat_id, HELP, KEYBOARD)
         return
 
     if cmd == "/check":
-        if len(parts) < 2 or not re.fullmatch(r"[A-Za-z]{5}", parts[1].lstrip("@")):
-            send(chat_id, "Напиши так: /check abcde (ровно 5 букв)")
+        if len(parts) < 2 or not re.fullmatch(r"[A-Za-z]{5,6}", parts[1].lstrip("@")):
+            send(chat_id, "Напиши так: /check abcde (5 или 6 букв)")
             return
         name = parts[1].lstrip("@").lower()
         res = check(name)
@@ -139,17 +178,23 @@ def handle(msg):
         return
 
     if cmd in ("/find", "/random"):
-        if chat_id in busy:
-            send(chat_id, "Поиск уже идёт, дождись результата.")
-            return
-        wait = COOLDOWN - (time.time() - last_run.get(chat_id, 0))
-        if wait > 0:
-            send(chat_id, "Подожди ещё %d сек." % int(wait))
-            return
-        last_run[chat_id] = time.time()
-        busy.add(chat_id)
-        gen = gen_pronounceable if cmd == "/find" else gen_random
-        threading.Thread(target=search, args=(chat_id, gen, parse_n(parts)), daemon=True).start()
+        length, n = parse_args(parts)
+        kind = "find" if cmd == "/find" else "rand"
+        start_search(chat_id, kind, length, n)
+
+
+def handle_callback(cb):
+    try:
+        api("answerCallbackQuery", callback_query_id=cb["id"])
+    except Exception:
+        pass
+    data = cb.get("data", "")
+    msg = cb.get("message")
+    if not msg or ":" not in data:
+        return
+    kind, length = data.split(":", 1)
+    if kind in ("find", "rand") and length in ("5", "6"):
+        start_search(msg["chat"]["id"], kind, int(length), DEFAULT_N)
 
 
 def keepalive():
@@ -186,6 +231,8 @@ def main():
                 offset = upd["update_id"] + 1
                 if "message" in upd:
                     handle(upd["message"])
+                elif "callback_query" in upd:
+                    handle_callback(upd["callback_query"])
         except KeyboardInterrupt:
             break
         except Exception as e:
