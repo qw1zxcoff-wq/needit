@@ -8,17 +8,21 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 
 TOKEN = os.environ.get("BOT_TOKEN") or "9159943768:AAF7uZuTYZ2QtIcYRSIjF44NDnpUb7pbOoQ"
 API = "https://api.telegram.org/bot%s/" % TOKEN
 
 # ================= НАСТРОЙКИ =================
+# Админ (только ему доступна админ-панель и команды). Можно добавить ещё через
+# переменную ADMIN_IDS в Render (через запятую).
+ADMIN_IDS = {6870042918} | {int(x) for x in os.environ.get("ADMIN_IDS", "").replace(" ", "").split(",") if x.isdigit()}
+
 # Цвета кнопок: "primary" (синий), "success" (зелёный), "danger" (красный), "" (без цвета)
 STYLE_FIND = "primary"
 STYLE_RAND = "success"
 STYLE_FAV = ""
-STYLE_WATCH = ""
 STYLE_CLEAR = "danger"
 STYLE_LEN_ON = "primary"   # выбранная длина
 STYLE_LEN_OFF = ""
@@ -27,8 +31,7 @@ STYLE_LEN_OFF = ""
 ICON_FIND = ""
 ICON_RAND = ""
 
-# Доступ: в Render -> Environment добавь ALLOWED_IDS=твойID (несколько через запятую).
-# Пока переменной нет, ботом может пользоваться любой. Свой ID покажет /myid
+# Если задать ALLOWED_IDS в Render (через запятую), пользоваться ботом смогут только они и админ.
 ALLOWED = {int(x) for x in os.environ.get("ALLOWED_IDS", "").replace(" ", "").split(",") if x.isdigit()}
 
 DELAY = 1.2            # пауза каждого потока между проверками (сек)
@@ -38,11 +41,12 @@ MAX_N = 60
 COOLDOWN = 15
 MIN_LEN = 5
 MAX_LEN = 12
+PROGRESS_EVERY = 2.0   # как часто обновлять сообщение с прогрессом (сек)
 WATCH_INTERVAL = 300   # как часто проверять слежки (сек)
 MAX_WATCH = 15
 AUTO_INTERVAL = 3600   # автопоиск раз в час
 AUTO_N = 30
-PING_INTERVAL = 20     # самопинг, чтобы Render не усыплял (сек), можно хоть 5
+PING_INTERVAL = 60     # самопинг, чтобы Render не усыплял (сек)
 MAX_TAKEN = 20000      # сколько занятых юзов помнить
 STATE_FILE = "state.json"
 DEFAULT_URL = "https://needit-li4n.onrender.com"
@@ -71,14 +75,20 @@ state = {
     "stats": {"checked": 0, "found": 0},
     "taken": [],
     "sent": {},        # chat_id -> уже присланные автопоиском
+    "users": {},       # chat_id -> {"first", "last", "n"}
+    "banned": [],
+    "private": False,  # закрытый режим: только админ и ALLOWED
 }
 taken = set()
 busy = set()
 last_run = {}
+last_job = {}      # chat_id -> (title, фабрика, n) для кнопки «Ещё»
+last_found = {}    # chat_id -> последние найденные юзы
+errlog = deque(maxlen=30)
 STARTED = time.time()
 
 HELP = (
-    "Ищу свободные юзернеймы длиной 5-12 букв. Выбирай кнопками или командами:\n\n"
+    "Ищу свободные юзернеймы длиной 5-12 букв. Жми кнопки или пиши команды:\n\n"
     "/find [N] - красивые (читаемые)\n"
     "/random [N] - случайные\n"
     "/mask a??ie - по маске (? = любая буква)\n"
@@ -86,16 +96,28 @@ HELP = (
     "/check имя - проверить один юз\n"
     "/len 8 - длина юза (5-12)\n"
     "/norep on|off - без повторяющихся букв\n"
-    "/charset letters|alnum - буквы или буквы+цифры (для случайных)\n"
+    "/charset letters|alnum - буквы или буквы+цифры\n"
     "/watch имя - следить, напишу когда освободится\n"
     "/unwatch имя, /watchlist\n"
     "/fav, /fav имя, /unfav имя - избранное\n"
-    "/auto on|off - автопоиск раз в час, присылаю только новые\n"
-    "/stats - статистика, /myid - твой ID\n\n"
+    "/auto on|off - автопоиск раз в час\n"
+    "/menu - кнопки, /stats - статистика, /myid - твой ID\n\n"
     "Пример: /find 8 30 - 30 красивых по 8 букв.\n"
-    "Пометка «свободен?» не гарантия: юз может быть зарезервирован или на Fragment.\n"
-    "Отправь мне премиум-эмодзи, и я пришлю его ID."
+    "Пометка «свободен?» не гарантия: юз может быть зарезервирован или на Fragment."
 )
+
+ADMIN_HELP = (
+    "Команды админа:\n"
+    "/admin - панель с кнопками\n"
+    "/broadcast текст - рассылка всем пользователям\n"
+    "/ban ID, /unban ID - блокировка\n"
+    "/users - список пользователей"
+)
+
+
+def logerr(text):
+    print(text, flush=True)
+    errlog.append("%s %s" % (time.strftime("%H:%M:%S"), text[:200]))
 
 
 # ---------- сохранение ----------
@@ -128,7 +150,13 @@ def save_state():
             f.write(raw)
         os.replace(tmp, STATE_FILE)
     except Exception as e:
-        print("save error:", e, flush=True)
+        logerr("save error: %s" % e)
+
+
+def saver():
+    while True:
+        time.sleep(120)
+        save_state()
 
 
 def cfg(chat_id):
@@ -141,8 +169,39 @@ def cfg(chat_id):
         return s
 
 
+def is_admin(chat_id):
+    return chat_id in ADMIN_IDS
+
+
 def allowed(chat_id):
-    return not ALLOWED or chat_id in ALLOWED
+    if is_admin(chat_id):
+        return True
+    with lock:
+        if chat_id in state["banned"]:
+            return False
+        if state["private"] and chat_id not in ALLOWED:
+            return False
+    if ALLOWED and chat_id not in ALLOWED:
+        return False
+    return True
+
+
+def touch(chat_id):
+    with lock:
+        u = state["users"].setdefault(str(chat_id), {"first": time.time(), "last": 0, "n": 0})
+        u["last"] = time.time()
+        u["n"] += 1
+
+
+def ago(ts):
+    sec = int(time.time() - ts)
+    if sec < 60:
+        return "только что"
+    if sec < 3600:
+        return "%d мин назад" % (sec // 60)
+    if sec < 86400:
+        return "%d ч назад" % (sec // 3600)
+    return "%d дн назад" % (sec // 86400)
 
 
 # ---------- Telegram API ----------
@@ -167,44 +226,110 @@ def btn(text, data, style="", icon="", emoji="", plain=False):
     return b
 
 
-def make_keyboard(chat_id, plain=False, fav_names=None):
+def make_keyboard(chat_id, kind="main", plain=False):
     s = cfg(chat_id)
     L = s["length"]
     rows = []
-    names = fav_names or []
-    for i in range(0, len(names), 2):
-        rows.append([btn("@" + n, "fav:" + n, STYLE_FAV, "", "⭐", plain) for n in names[i:i + 2]])
-    rows.append([
-        btn("красивые · %d" % L, "go:find", STYLE_FIND, ICON_FIND, "✨", plain),
-        btn("случайные · %d" % L, "go:rand", STYLE_RAND, ICON_RAND, "🎲", plain),
-    ])
-    for start in (MIN_LEN, MIN_LEN + 4):
+    if kind == "main":
         rows.append([
-            btn(("• %d" if n == L else "%d") % n, "len:%d" % n,
-                STYLE_LEN_ON if n == L else STYLE_LEN_OFF, "", "", plain)
-            for n in range(start, min(start + 4, MAX_LEN + 1))
+            btn("красивые · %d" % L, "go:find", STYLE_FIND, ICON_FIND, "✨", plain),
+            btn("случайные · %d" % L, "go:rand", STYLE_RAND, ICON_RAND, "🎲", plain),
         ])
-    rows.append([
-        btn("Слежки", "list", STYLE_WATCH, "", "👁", plain),
-        btn("Избранное", "favs", STYLE_FAV, "", "⭐", plain),
-    ])
-    rows.append([btn("Очистить слежки", "clear", STYLE_CLEAR, "", "🗑", plain)])
+        last = [btn("Меню", "menu", "", "", "⚙", plain)]
+        if is_admin(chat_id):
+            last.append(btn("Админ", "adm:open", "", "", "🛠", plain))
+        rows.append(last)
+    elif kind == "result":
+        if last_found.get(chat_id):
+            rows.append([btn("Все в избранное", "favall", STYLE_FAV, "", "⭐", plain)])
+        rows.append([
+            btn("Ещё", "again", STYLE_FIND, "", "🔄", plain),
+            btn("Меню", "menu", "", "", "⚙", plain),
+        ])
+    elif kind == "menu":
+        for start in (MIN_LEN, MIN_LEN + 4):
+            rows.append([
+                btn(("• %d" if n == L else "%d") % n, "len:%d" % n,
+                    STYLE_LEN_ON if n == L else STYLE_LEN_OFF, "", "", plain)
+                for n in range(start, min(start + 4, MAX_LEN + 1))
+            ])
+        rows.append([
+            btn("Слежки", "list", "", "", "👁", plain),
+            btn("Избранное", "favs", "", "", "⭐", plain),
+        ])
+        rows.append([
+            btn("Очистить слежки", "clear", STYLE_CLEAR, "", "🗑", plain),
+            btn("Назад", "back", "", "", "⬅", plain),
+        ])
+    elif kind == "admin":
+        with lock:
+            priv = state["private"]
+        rows.append([
+            btn("Статистика", "adm:stats", "", "", "📊", plain),
+            btn("Юзеры", "adm:users", "", "", "👥", plain),
+        ])
+        rows.append([btn("Закрытый доступ: %s" % ("вкл" if priv else "выкл"), "adm:private",
+                         "success" if priv else "", "", "🔒" if priv else "🔓", plain)])
+        rows.append([
+            btn("Рассылка", "adm:bc", "", "", "📢", plain),
+            btn("Бан", "adm:ban", "", "", "🚫", plain),
+        ])
+        rows.append([
+            btn("Сброс кэша", "adm:clear", "", "", "🧹", plain),
+            btn("Ошибки", "adm:errors", "", "", "📜", plain),
+        ])
+        rows.append([btn("Перезапуск", "adm:restart", STYLE_CLEAR, "", "♻", plain)])
+    elif kind == "confirm":
+        rows.append([
+            btn("Да, перезапустить", "adm:restart_yes", STYLE_CLEAR, "", "✅", plain),
+            btn("Отмена", "adm:open2", "", "", "❌", plain),
+        ])
     return {"inline_keyboard": rows}
 
 
-def send(chat_id, text, keyboard=False, fav_names=None):
+def send_msg(chat_id, text, kind=None):
+    """Отправляет сообщение, возвращает message_id или None."""
     params = {"chat_id": chat_id, "text": text[:3900]}
-    try:
-        if keyboard:
-            try:
-                api("sendMessage", reply_markup=make_keyboard(chat_id, False, fav_names), **params)
-            except Exception as e:
-                print("keyboard error, fallback:", e, flush=True)
-                api("sendMessage", reply_markup=make_keyboard(chat_id, True, fav_names), **params)
-        else:
-            api("sendMessage", **params)
-    except Exception as e:
-        print("send error:", e, flush=True)
+    for plain in ((False, True) if kind else (False,)):
+        try:
+            if kind:
+                r = api("sendMessage", reply_markup=make_keyboard(chat_id, kind, plain), **params)
+            else:
+                r = api("sendMessage", **params)
+            return r["result"]["message_id"]
+        except Exception as e:
+            logerr("send error: %s" % e)
+    return None
+
+
+def send(chat_id, text, kind=None):
+    return send_msg(chat_id, text, kind) is not None
+
+
+def edit_text(chat_id, message_id, text, kind=None):
+    params = {"chat_id": chat_id, "message_id": message_id, "text": text[:3900]}
+    for plain in ((False, True) if kind else (False,)):
+        try:
+            if kind:
+                api("editMessageText", reply_markup=make_keyboard(chat_id, kind, plain), **params)
+            else:
+                api("editMessageText", **params)
+            return True
+        except Exception as e:
+            if "not modified" in str(e):
+                return True
+            logerr("edit error: %s" % e)
+    return False
+
+
+def edit_keyboard(chat_id, message_id, kind):
+    for plain in (False, True):
+        try:
+            api("editMessageReplyMarkup", chat_id=chat_id, message_id=message_id,
+                reply_markup=make_keyboard(chat_id, kind, plain))
+            return
+        except Exception:
+            continue
 
 
 def answer(cb_id, text=None):
@@ -215,16 +340,6 @@ def answer(cb_id, text=None):
             api("answerCallbackQuery", callback_query_id=cb_id)
     except Exception:
         pass
-
-
-def edit_keyboard(chat_id, message_id):
-    for plain in (False, True):
-        try:
-            api("editMessageReplyMarkup", chat_id=chat_id, message_id=message_id,
-                reply_markup=make_keyboard(chat_id, plain))
-            return
-        except Exception:
-            continue
 
 
 # ---------- генерация и проверка ----------
@@ -293,6 +408,14 @@ def mask_namer(mask):
     return lambda: fill_mask(mask)
 
 
+def words_factory(names, shuffle):
+    def f():
+        lst = random.sample(names, len(names)) if shuffle else list(names)
+        it = iter(lst)
+        return lambda: next(it, None)
+    return f
+
+
 def check(name):
     """True = похоже свободен, False = занят, None = ошибка/лимит"""
     req = urllib.request.Request(
@@ -304,6 +427,7 @@ def check(name):
             html = r.read().decode("utf-8", errors="ignore")
     except urllib.error.HTTPError as e:
         if e.code == 429:
+            logerr("t.me: лимит 429, жду 30 сек")
             time.sleep(30)
         return None
     except Exception:
@@ -320,7 +444,7 @@ def record(name, res, cached):
             taken.add(name)
 
 
-def scan(next_name, n):
+def scan(next_name, n, progress=None):
     """Проверяет до n юзов в несколько потоков. Возвращает (найдено, проверено, упёрлись_в_лимит)."""
     found = []
     ctl = {"picked": 0, "done": 0, "errors": 0, "attempts": 0}
@@ -357,7 +481,13 @@ def scan(next_name, n):
                 ctl["done"] += 1
                 if res:
                     found.append(name)
+                snap = (ctl["done"], len(found))
             record(name, res, cached)
+            if progress:
+                try:
+                    progress(*snap)
+                except Exception:
+                    pass
 
     with ThreadPoolExecutor(max_workers=WORKERS) as ex:
         for _ in range(WORKERS):
@@ -365,24 +495,44 @@ def scan(next_name, n):
     return found, ctl["done"], ctl["errors"] >= 6
 
 
-def search(chat_id, title, next_name, n):
+def progress_text(title, done, n, found_cnt):
+    filled = int(10 * done / n) if n else 0
+    return "%s\n%s %d/%d\nНайдено: %d" % (title, "▓" * filled + "░" * (10 - filled), done, n, found_cnt)
+
+
+def search(chat_id, title, make_next, n):
     try:
-        send(chat_id, "%s: проверяю %d юзов, подожди ~%d сек..." % (title, n, int(n * DELAY / WORKERS) + 3))
-        found, done, limited = scan(next_name, n)
+        mid = send_msg(chat_id, progress_text(title, 0, n, 0))
+        plock = threading.Lock()
+        last_edit = [time.time()]
+
+        def on_progress(done, found_cnt):
+            if not mid:
+                return
+            with plock:
+                now = time.time()
+                if now - last_edit[0] < PROGRESS_EVERY:
+                    return
+                last_edit[0] = now
+            edit_text(chat_id, mid, progress_text(title, done, n, found_cnt))
+
+        found, done, limited = scan(make_next(), n, on_progress)
+        last_found[chat_id] = list(found)
         if found:
-            text = "Похоже свободны (%d из %d):\n%s\n\nНажми на юз ниже, чтобы добавить в избранное." % (
-                len(found), done, "\n".join("@" + x for x in found))
+            text = "%s\nПохоже свободны (%d из %d):\n%s" % (
+                title, len(found), done, "\n".join("@" + x for x in found))
         else:
-            text = "Проверено %d, свободных не нашлось. Попробуй ещё раз." % done
+            text = "%s\nПроверено %d, свободных не нашлось. Попробуй ещё раз." % (title, done)
         if limited:
             text += "\n\nt.me часто не отвечает, остановился. Попробуй позже."
         save_state()
-        send(chat_id, text, keyboard=True, fav_names=found[:8])
+        if not (mid and edit_text(chat_id, mid, text, "result")):
+            send(chat_id, text, "result")
     finally:
         busy.discard(chat_id)
 
 
-def start_search(chat_id, title, next_name, n):
+def start_search(chat_id, title, make_next, n):
     if chat_id in busy:
         send(chat_id, "Поиск уже идёт, дождись результата.")
         return
@@ -391,15 +541,20 @@ def start_search(chat_id, title, next_name, n):
         send(chat_id, "Подожди ещё %d сек." % int(wait))
         return
     last_run[chat_id] = time.time()
+    last_job[chat_id] = (title, make_next, n)
     busy.add(chat_id)
-    threading.Thread(target=search, args=(chat_id, title, next_name, n), daemon=True).start()
+    threading.Thread(target=search, args=(chat_id, title, make_next, n), daemon=True).start()
 
 
 def launch(chat_id, kind, length=None, n=DEFAULT_N):
     s = cfg(chat_id)
     L = length or s["length"]
     title = ("Красивые" if kind == "find" else "Случайные") + " по %d" % L
-    start_search(chat_id, title, lambda: make_name(kind, L, s["norep"], s["charset"]), n)
+
+    def factory():
+        return lambda: make_name(kind, L, s["norep"], s["charset"])
+
+    start_search(chat_id, title, factory, n)
 
 
 def parse_num_args(parts):
@@ -448,9 +603,9 @@ def clear_watches(chat_id):
 def send_watchlist(chat_id):
     names = my_watches(chat_id)
     if names:
-        send(chat_id, "Слежу за:\n" + "\n".join("@" + n for n in names), keyboard=True)
+        send(chat_id, "Слежу за:\n" + "\n".join("@" + n for n in names))
     else:
-        send(chat_id, "Слежек нет. Добавь: /watch abcde", keyboard=True)
+        send(chat_id, "Слежек нет. Добавь: /watch abcde")
 
 
 def get_favs(chat_id):
@@ -482,9 +637,9 @@ def send_favs(chat_id):
     names = get_favs(chat_id)
     if names:
         send(chat_id, "Избранное:\n" + "\n".join("@" + n for n in names) +
-             "\n\nСледить: /watch имя. Убрать: /unfav имя.", keyboard=True)
+             "\n\nСледить: /watch имя. Убрать: /unfav имя.")
     else:
-        send(chat_id, "Избранное пусто. Нажми ⭐ под найденным юзом.", keyboard=True)
+        send(chat_id, "Избранное пусто. Нажми ⭐ под найденными юзами.")
 
 
 def cmd_watch(chat_id, parts):
@@ -533,6 +688,8 @@ def auto_worker():
             chats = [int(c) for c, s in state["settings"].items() if s.get("auto")]
         for chat_id in chats:
             try:
+                if not allowed(chat_id):
+                    continue
                 s = cfg(chat_id)
                 found, done, limited = scan(
                     lambda: make_name("find", s["length"], s["norep"], s["charset"]), AUTO_N)
@@ -543,10 +700,11 @@ def auto_worker():
                     del sent[:-500]
                 save_state()
                 if new:
+                    last_found[chat_id] = list(new)
                     send(chat_id, "🔔 Автопоиск, новые похоже свободные (%d):\n%s" % (
-                        len(new), "\n".join("@" + x for x in new)), keyboard=True, fav_names=new[:8])
+                        len(new), "\n".join("@" + x for x in new)), "result")
             except Exception as e:
-                print("auto error:", e, flush=True)
+                logerr("auto error: %s" % e)
 
 
 def pinger():
@@ -562,35 +720,145 @@ def pinger():
                 r.read()
                 print("ping ok", r.status, time.strftime("%H:%M:%S"), flush=True)
         except Exception as e:
-            print("ping error:", e, flush=True)
+            logerr("ping error: %s" % e)
         time.sleep(PING_INTERVAL)
 
 
-# ---------- обработка сообщений ----------
+# ---------- админка ----------
 
 def fmt_uptime():
     sec = int(time.time() - STARTED)
     return "%dч %dм" % (sec // 3600, (sec % 3600) // 60)
 
 
-def send_stats(chat_id):
-    s = cfg(chat_id)
+def admin_stats_text():
     with lock:
         st = dict(state["stats"])
-        tk = len(taken)
-        total_w = len(state["watches"])
+        users = dict(state["users"])
+        day = sum(1 for u in users.values() if time.time() - u.get("last", 0) < 86400)
+        return (
+            "Статистика бота:\nПользователей: %d (за сутки: %d)\nПроверено: %d\nНайдено свободных: %d\n"
+            "Слежек: %d\nЗанятых в памяти: %d\nЗабанено: %d\nЗакрытый доступ: %s\nРаботаю: %s" % (
+                len(users), day, st["checked"], st["found"], len(state["watches"]), len(taken),
+                len(state["banned"]), "вкл" if state["private"] else "выкл", fmt_uptime()))
+
+
+def admin_users_text():
+    with lock:
+        items = sorted(state["users"].items(), key=lambda kv: kv[1].get("last", 0), reverse=True)[:25]
+        total = len(state["users"])
+    if not items:
+        return "Пользователей пока нет."
+    lines = ["%s · %d запросов · %s" % (uid, u.get("n", 0), ago(u.get("last", 0))) for uid, u in items]
+    return "Пользователи (последние %d из %d):\n%s" % (len(items), total, "\n".join(lines))
+
+
+def do_broadcast(admin_id, text):
+    with lock:
+        ids = [int(i) for i in state["users"].keys() if int(i) not in state["banned"]]
+    ok = 0
+    for uid in ids:
+        if send(uid, text):
+            ok += 1
+        time.sleep(0.06)
+    send(admin_id, "Рассылка завершена: доставлено %d из %d." % (ok, len(ids)))
+
+
+def do_restart(chat_id):
+    send(chat_id, "♻ Перезапускаюсь, вернусь через пару секунд...")
+    save_state()
+    time.sleep(1)
+    os._exit(0)
+
+
+def admin_command(chat_id, cmd, parts, text):
+    if cmd == "/admin":
+        send(chat_id, "🛠 Админ-панель\n\n" + ADMIN_HELP, "admin")
+    elif cmd == "/broadcast":
+        body = text.split(None, 1)[1].strip() if len(text.split(None, 1)) > 1 else ""
+        if not body:
+            send(chat_id, "Напиши так: /broadcast текст сообщения")
+            return
+        send(chat_id, "Начинаю рассылку...")
+        threading.Thread(target=do_broadcast, args=(chat_id, body), daemon=True).start()
+    elif cmd in ("/ban", "/unban"):
+        if len(parts) < 2 or not parts[1].lstrip("-").isdigit():
+            send(chat_id, "Напиши так: %s 123456789" % cmd)
+            return
+        uid = int(parts[1])
+        if is_admin(uid):
+            send(chat_id, "Админа банить нельзя.")
+            return
+        with lock:
+            if cmd == "/ban":
+                if uid not in state["banned"]:
+                    state["banned"].append(uid)
+            elif uid in state["banned"]:
+                state["banned"].remove(uid)
+        save_state()
+        send(chat_id, "ID %d %s." % (uid, "заблокирован" if cmd == "/ban" else "разблокирован"))
+    elif cmd == "/users":
+        send(chat_id, admin_users_text())
+
+
+def admin_callback(cb_id, chat_id, mid, action):
+    if action == "open":
+        answer(cb_id)
+        send(chat_id, "🛠 Админ-панель\n\n" + ADMIN_HELP, "admin")
+    elif action == "open2":
+        answer(cb_id)
+        edit_keyboard(chat_id, mid, "admin")
+    elif action == "stats":
+        answer(cb_id)
+        send(chat_id, admin_stats_text())
+    elif action == "users":
+        answer(cb_id)
+        send(chat_id, admin_users_text())
+    elif action == "private":
+        with lock:
+            state["private"] = not state["private"]
+            now = state["private"]
+        save_state()
+        answer(cb_id, "Закрытый доступ: %s" % ("вкл" if now else "выкл"))
+        edit_keyboard(chat_id, mid, "admin")
+    elif action == "bc":
+        answer(cb_id)
+        send(chat_id, "Рассылка: напиши /broadcast текст, и бот отправит его всем пользователям.")
+    elif action == "ban":
+        answer(cb_id)
+        send(chat_id, "Бан: /ban ID и /unban ID. ID пользователей смотри в списке «Юзеры».")
+    elif action == "clear":
+        with lock:
+            taken.clear()
+        save_state()
+        answer(cb_id, "Кэш занятых очищен")
+    elif action == "errors":
+        answer(cb_id)
+        send(chat_id, "Последние ошибки:\n" + ("\n".join(errlog) if errlog else "ошибок нет"))
+    elif action == "restart":
+        answer(cb_id)
+        edit_keyboard(chat_id, mid, "confirm")
+    elif action == "restart_yes":
+        answer(cb_id, "Перезапуск...")
+        threading.Thread(target=do_restart, args=(chat_id,), daemon=True).start()
+    else:
+        answer(cb_id)
+
+
+# ---------- обработка сообщений ----------
+
+def send_stats(chat_id):
+    s = cfg(chat_id)
     send(chat_id,
-         "Статистика:\nПроверено: %d\nНайдено свободных: %d\nЗанятых в памяти: %d\n"
-         "Слежек (твоих/всех): %d/%d\nИзбранное: %d\nДлина: %d, без повторов: %s, символы: %s, автопоиск: %s\n"
-         "Работаю: %s" % (
-             st["checked"], st["found"], tk, len(my_watches(chat_id)), total_w,
-             len(get_favs(chat_id)), s["length"], "да" if s["norep"] else "нет",
-             s["charset"], "вкл" if s["auto"] else "выкл", fmt_uptime()),
-         keyboard=True)
+         "Твои настройки:\nДлина: %d\nБез повторов: %s\nСимволы: %s\nАвтопоиск: %s\n"
+         "Слежек: %d\nИзбранное: %d" % (
+             s["length"], "да" if s["norep"] else "нет", s["charset"],
+             "вкл" if s["auto"] else "выкл", len(my_watches(chat_id)), len(get_favs(chat_id))))
 
 
 def handle(msg):
     chat_id = msg["chat"]["id"]
+    touch(chat_id)
 
     # если прислали премиум-эмодзи, показываем его ID
     ids = [
@@ -615,10 +883,17 @@ def handle(msg):
         send(chat_id, "Нет доступа. Твой ID: %d" % chat_id)
         return
 
+    if cmd in ("/admin", "/broadcast", "/ban", "/unban", "/users"):
+        if is_admin(chat_id):
+            admin_command(chat_id, cmd, parts, text)
+        return
+
     s = cfg(chat_id)
 
     if cmd in ("/start", "/help"):
-        send(chat_id, HELP, keyboard=True)
+        send(chat_id, HELP + ("\n\n" + ADMIN_HELP if is_admin(chat_id) else ""), "main")
+    elif cmd == "/menu":
+        send(chat_id, "Выбери:", "main")
     elif cmd == "/check":
         name = parts[1].lstrip("@").lower() if len(parts) > 1 else ""
         if not valid(name):
@@ -641,34 +916,33 @@ def handle(msg):
             send(chat_id, "В маске нет «?». Для одного юза используй /check.")
             return
         n = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else DEFAULT_N
-        start_search(chat_id, "Маска " + mask, mask_namer(mask), max(1, min(n, MAX_N)))
+        start_search(chat_id, "Маска " + mask, lambda: mask_namer(mask), max(1, min(n, MAX_N)))
     elif cmd == "/words":
         custom = [w.lstrip("@").lower() for w in parts[1:] if valid(w.lstrip("@").lower())]
         if custom:
-            names, n = custom[:MAX_N], min(len(custom), MAX_N)
+            names = custom[:MAX_N]
+            start_search(chat_id, "Слова", words_factory(names, False), len(names))
         else:
-            names, n = random.sample(WORDS, len(WORDS)), DEFAULT_N
-        it = iter(names)
-        start_search(chat_id, "Слова", lambda: next(it, None), n)
+            start_search(chat_id, "Слова", words_factory(WORDS, True), DEFAULT_N)
     elif cmd == "/len":
         if len(parts) > 1 and parts[1].isdigit() and MIN_LEN <= int(parts[1]) <= MAX_LEN:
             s["length"] = int(parts[1])
             save_state()
-            send(chat_id, "Длина: %d букв." % s["length"], keyboard=True)
+            send(chat_id, "Длина: %d букв." % s["length"])
         else:
             send(chat_id, "Напиши так: /len 8 (от %d до %d)" % (MIN_LEN, MAX_LEN))
     elif cmd == "/norep":
         if len(parts) > 1 and parts[1].lower() in ("on", "off"):
             s["norep"] = parts[1].lower() == "on"
             save_state()
-            send(chat_id, "Без повторяющихся букв: %s." % ("вкл" if s["norep"] else "выкл"), keyboard=True)
+            send(chat_id, "Без повторяющихся букв: %s." % ("вкл" if s["norep"] else "выкл"))
         else:
             send(chat_id, "Напиши так: /norep on или /norep off")
     elif cmd == "/charset":
         if len(parts) > 1 and parts[1].lower() in ("letters", "alnum"):
             s["charset"] = parts[1].lower()
             save_state()
-            send(chat_id, "Символы для случайных: %s." % ("только буквы" if s["charset"] == "letters" else "буквы и цифры"), keyboard=True)
+            send(chat_id, "Символы для случайных: %s." % ("только буквы" if s["charset"] == "letters" else "буквы и цифры"))
         else:
             send(chat_id, "Напиши так: /charset letters или /charset alnum")
     elif cmd == "/auto":
@@ -676,9 +950,9 @@ def handle(msg):
             s["auto"] = parts[1].lower() == "on"
             save_state()
             if s["auto"]:
-                send(chat_id, "Автопоиск включён: раз в час проверяю %d красивых по %d букв и пишу только новые находки." % (AUTO_N, s["length"]), keyboard=True)
+                send(chat_id, "Автопоиск включён: раз в час проверяю %d красивых по %d букв и пишу только новые находки." % (AUTO_N, s["length"]))
             else:
-                send(chat_id, "Автопоиск выключен.", keyboard=True)
+                send(chat_id, "Автопоиск выключен.")
         else:
             send(chat_id, "Напиши так: /auto on или /auto off")
     elif cmd == "/watch":
@@ -715,30 +989,47 @@ def handle_callback(cb):
         answer(cb_id)
         return
     chat_id = msg["chat"]["id"]
+    mid = msg["message_id"]
+    touch(chat_id)
     if not allowed(chat_id):
         answer(cb_id, "Нет доступа")
         return
     s = cfg(chat_id)
 
-    if data.startswith("len:"):
+    if data.startswith("adm:"):
+        if is_admin(chat_id):
+            admin_callback(cb_id, chat_id, mid, data[4:])
+        else:
+            answer(cb_id, "Нет доступа")
+    elif data == "menu":
+        answer(cb_id)
+        edit_keyboard(chat_id, mid, "menu")
+    elif data == "back":
+        answer(cb_id)
+        edit_keyboard(chat_id, mid, "main")
+    elif data.startswith("len:"):
         n = int(data[4:]) if data[4:].isdigit() else 0
         if MIN_LEN <= n <= MAX_LEN:
             s["length"] = n
             save_state()
             answer(cb_id, "Длина: %d" % n)
-            edit_keyboard(chat_id, msg["message_id"])
+            edit_keyboard(chat_id, mid, "menu")
         else:
             answer(cb_id)
     elif data in ("go:find", "go:rand"):
         answer(cb_id)
         launch(chat_id, data[3:])
-    elif data.startswith("fav:"):
-        name = data[4:]
-        if valid(name):
-            added = add_fav(chat_id, name)
-            answer(cb_id, "⭐ @%s %s" % (name, "в избранном" if added else "уже в избранном"))
+    elif data == "again":
+        answer(cb_id)
+        job = last_job.get(chat_id)
+        if job:
+            start_search(chat_id, *job)
         else:
-            answer(cb_id)
+            send(chat_id, "Нечего повторять, сначала запусти поиск.")
+    elif data == "favall":
+        names = last_found.get(chat_id) or []
+        added = sum(1 for n in names if add_fav(chat_id, n))
+        answer(cb_id, "⭐ Добавлено в избранное: %d" % added)
     elif data == "list":
         answer(cb_id)
         send_watchlist(chat_id)
@@ -782,7 +1073,7 @@ def main():
         return
     load_state()
     keepalive()
-    for fn in (watcher, auto_worker, pinger):
+    for fn in (watcher, auto_worker, pinger, saver):
         threading.Thread(target=fn, daemon=True).start()
     print("Бот запущен", flush=True)
     offset = 0
@@ -798,7 +1089,7 @@ def main():
         except KeyboardInterrupt:
             break
         except Exception as e:
-            print("poll error:", e, flush=True)
+            logerr("poll error: %s" % e)
             time.sleep(5)
 
 
