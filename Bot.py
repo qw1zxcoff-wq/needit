@@ -122,3 +122,75 @@ def handle(msg):
 
     if cmd in ("/start", "/help"):
         send(chat_id, HELP)
+        return
+
+    if cmd == "/check":
+        if len(parts) < 2 or not re.fullmatch(r"[A-Za-z]{5}", parts[1].lstrip("@")):
+            send(chat_id, "Напиши так: /check abcde (ровно 5 букв)")
+            return
+        name = parts[1].lstrip("@").lower()
+        res = check(name)
+        if res is None:
+            send(chat_id, "Не удалось проверить, попробуй позже.")
+        elif res:
+            send(chat_id, "@%s - похоже свободен" % name)
+        else:
+            send(chat_id, "@%s - занят" % name)
+        return
+
+    if cmd in ("/find", "/random"):
+        if chat_id in busy:
+            send(chat_id, "Поиск уже идёт, дождись результата.")
+            return
+        wait = COOLDOWN - (time.time() - last_run.get(chat_id, 0))
+        if wait > 0:
+            send(chat_id, "Подожди ещё %d сек." % int(wait))
+            return
+        last_run[chat_id] = time.time()
+        busy.add(chat_id)
+        gen = gen_pronounceable if cmd == "/find" else gen_random
+        threading.Thread(target=search, args=(chat_id, gen, parse_n(parts)), daemon=True).start()
+
+
+def keepalive():
+    """Нужен для хостингов, которые требуют открытый порт (например Render)."""
+    port = os.environ.get("PORT")
+    if not port:
+        return
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+
+    class H(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"ok")
+
+        def log_message(self, *a):
+            pass
+
+    srv = HTTPServer(("0.0.0.0", int(port)), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+
+
+def main():
+    if not TOKEN:
+        print("Нет токена")
+        return
+    keepalive()
+    print("Бот запущен", flush=True)
+    offset = 0
+    while True:
+        try:
+            r = api("getUpdates", offset=offset, timeout=30)
+            for upd in r.get("result", []):
+                offset = upd["update_id"] + 1
+                if "message" in upd:
+                    handle(upd["message"])
+        except KeyboardInterrupt:
+            break
+        except Exception as e:
+            print("poll error:", e, flush=True)
+            time.sleep(5)
+
+
+main()
