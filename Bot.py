@@ -11,7 +11,7 @@ import urllib.request
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 
-TOKEN = os.environ.get("BOT_TOKEN") or "9159943768:AAF7uZuTYZ2QtIcYRSIjF44NDnpUb7pbOoQ"
+TOKEN = os.environ.get("BOT_TOKEN") or "9159943768:AAFSDd2wL8W3zlMg7oYd3CfIPl5muErdXrA"
 API = "https://api.telegram.org/bot%s/" % TOKEN
 
 # ================= НАСТРОЙКИ =================
