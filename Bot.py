@@ -42,7 +42,7 @@ WATCH_INTERVAL = 300   # как часто проверять слежки (се
 MAX_WATCH = 15
 AUTO_INTERVAL = 3600   # автопоиск раз в час
 AUTO_N = 30
-PING_INTERVAL = 15    # самопинг, чтобы Render не усыплял (сек), можно хоть 5
+PING_INTERVAL = 20     # самопинг, чтобы Render не усыплял (сек), можно хоть 5
 MAX_TAKEN = 20000      # сколько занятых юзов помнить
 STATE_FILE = "state.json"
 DEFAULT_URL = "https://needit-li4n.onrender.com"
@@ -618,4 +618,189 @@ def handle(msg):
     s = cfg(chat_id)
 
     if cmd in ("/start", "/help"):
-        send(chat_id, HELP, keyboard=True
+        send(chat_id, HELP, keyboard=True)
+    elif cmd == "/check":
+        name = parts[1].lstrip("@").lower() if len(parts) > 1 else ""
+        if not valid(name):
+            send(chat_id, "Напиши так: /check abcde (5-32 символа, латиница, цифры, _)")
+            return
+        res = check(name)
+        if res is None:
+            send(chat_id, "Не удалось проверить, попробуй позже.")
+        else:
+            send(chat_id, "@%s - %s" % (name, "похоже свободен" if res else "занят"))
+    elif cmd in ("/find", "/random"):
+        length, n = parse_num_args(parts)
+        launch(chat_id, "find" if cmd == "/find" else "rand", length, n)
+    elif cmd == "/mask":
+        mask = parts[1].lstrip("@").lower() if len(parts) > 1 else ""
+        if (not re.fullmatch(r"[a-z?][a-z0-9_?]{4,31}", mask)) or mask.endswith("_"):
+            send(chat_id, "Напиши так: /mask a??ie (? = любая буква, минимум 5 символов)")
+            return
+        if "?" not in mask:
+            send(chat_id, "В маске нет «?». Для одного юза используй /check.")
+            return
+        n = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else DEFAULT_N
+        start_search(chat_id, "Маска " + mask, mask_namer(mask), max(1, min(n, MAX_N)))
+    elif cmd == "/words":
+        custom = [w.lstrip("@").lower() for w in parts[1:] if valid(w.lstrip("@").lower())]
+        if custom:
+            names, n = custom[:MAX_N], min(len(custom), MAX_N)
+        else:
+            names, n = random.sample(WORDS, len(WORDS)), DEFAULT_N
+        it = iter(names)
+        start_search(chat_id, "Слова", lambda: next(it, None), n)
+    elif cmd == "/len":
+        if len(parts) > 1 and parts[1].isdigit() and MIN_LEN <= int(parts[1]) <= MAX_LEN:
+            s["length"] = int(parts[1])
+            save_state()
+            send(chat_id, "Длина: %d букв." % s["length"], keyboard=True)
+        else:
+            send(chat_id, "Напиши так: /len 8 (от %d до %d)" % (MIN_LEN, MAX_LEN))
+    elif cmd == "/norep":
+        if len(parts) > 1 and parts[1].lower() in ("on", "off"):
+            s["norep"] = parts[1].lower() == "on"
+            save_state()
+            send(chat_id, "Без повторяющихся букв: %s." % ("вкл" if s["norep"] else "выкл"), keyboard=True)
+        else:
+            send(chat_id, "Напиши так: /norep on или /norep off")
+    elif cmd == "/charset":
+        if len(parts) > 1 and parts[1].lower() in ("letters", "alnum"):
+            s["charset"] = parts[1].lower()
+            save_state()
+            send(chat_id, "Символы для случайных: %s." % ("только буквы" if s["charset"] == "letters" else "буквы и цифры"), keyboard=True)
+        else:
+            send(chat_id, "Напиши так: /charset letters или /charset alnum")
+    elif cmd == "/auto":
+        if len(parts) > 1 and parts[1].lower() in ("on", "off"):
+            s["auto"] = parts[1].lower() == "on"
+            save_state()
+            if s["auto"]:
+                send(chat_id, "Автопоиск включён: раз в час проверяю %d красивых по %d букв и пишу только новые находки." % (AUTO_N, s["length"]), keyboard=True)
+            else:
+                send(chat_id, "Автопоиск выключен.", keyboard=True)
+        else:
+            send(chat_id, "Напиши так: /auto on или /auto off")
+    elif cmd == "/watch":
+        cmd_watch(chat_id, parts)
+    elif cmd == "/unwatch":
+        name = parts[1].lstrip("@").lower() if len(parts) > 1 else ""
+        if remove_watch(chat_id, name):
+            send(chat_id, "Больше не слежу за @%s." % name)
+        else:
+            send(chat_id, "Напиши так: /unwatch abcde (из твоих слежек)")
+    elif cmd == "/watchlist":
+        send_watchlist(chat_id)
+    elif cmd == "/fav":
+        if len(parts) > 1:
+            name = parts[1].lstrip("@").lower()
+            if valid(name):
+                send(chat_id, "@%s %s" % (name, "добавлен в избранное." if add_fav(chat_id, name) else "уже в избранном."))
+            else:
+                send(chat_id, "Неверный юзернейм.")
+        else:
+            send_favs(chat_id)
+    elif cmd == "/unfav":
+        name = parts[1].lstrip("@").lower() if len(parts) > 1 else ""
+        send(chat_id, "Убрал @%s из избранного." % name if remove_fav(chat_id, name) else "Такого нет в избранном.")
+    elif cmd == "/stats":
+        send_stats(chat_id)
+
+
+def handle_callback(cb):
+    cb_id = cb["id"]
+    msg = cb.get("message")
+    data = cb.get("data", "")
+    if not msg:
+        answer(cb_id)
+        return
+    chat_id = msg["chat"]["id"]
+    if not allowed(chat_id):
+        answer(cb_id, "Нет доступа")
+        return
+    s = cfg(chat_id)
+
+    if data.startswith("len:"):
+        n = int(data[4:]) if data[4:].isdigit() else 0
+        if MIN_LEN <= n <= MAX_LEN:
+            s["length"] = n
+            save_state()
+            answer(cb_id, "Длина: %d" % n)
+            edit_keyboard(chat_id, msg["message_id"])
+        else:
+            answer(cb_id)
+    elif data in ("go:find", "go:rand"):
+        answer(cb_id)
+        launch(chat_id, data[3:])
+    elif data.startswith("fav:"):
+        name = data[4:]
+        if valid(name):
+            added = add_fav(chat_id, name)
+            answer(cb_id, "⭐ @%s %s" % (name, "в избранном" if added else "уже в избранном"))
+        else:
+            answer(cb_id)
+    elif data == "list":
+        answer(cb_id)
+        send_watchlist(chat_id)
+    elif data == "favs":
+        answer(cb_id)
+        send_favs(chat_id)
+    elif data == "clear":
+        clear_watches(chat_id)
+        answer(cb_id, "Слежки удалены")
+    else:
+        answer(cb_id)
+
+
+def keepalive():
+    """Открытый порт для хостингов вроде Render + ответ на пинги."""
+    port = os.environ.get("PORT")
+    if not port:
+        return
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+
+    class H(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"ok")
+
+        def do_HEAD(self):
+            self.send_response(200)
+            self.end_headers()
+
+        def log_message(self, *a):
+            pass
+
+    srv = HTTPServer(("0.0.0.0", int(port)), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+
+
+def main():
+    if not TOKEN:
+        print("Нет токена")
+        return
+    load_state()
+    keepalive()
+    for fn in (watcher, auto_worker, pinger):
+        threading.Thread(target=fn, daemon=True).start()
+    print("Бот запущен", flush=True)
+    offset = 0
+    while True:
+        try:
+            r = api("getUpdates", offset=offset, timeout=30)
+            for upd in r.get("result", []):
+                offset = upd["update_id"] + 1
+                if "message" in upd:
+                    handle(upd["message"])
+                elif "callback_query" in upd:
+                    handle_callback(upd["callback_query"])
+        except KeyboardInterrupt:
+            break
+        except Exception as e:
+            print("poll error:", e, flush=True)
+            time.sleep(5)
+
+
+if __name__ == "__main__":
+    main()
