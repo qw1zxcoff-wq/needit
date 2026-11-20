@@ -11,7 +11,7 @@ import urllib.request
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 
-TOKEN = os.environ.get("BOT_TOKEN") 
+TOKEN = os.environ.get("BOT_TOKEN", "")  # токен только в Render -> Environment, в код его не вставляй
 API = "https://api.telegram.org/bot%s/" % TOKEN
 
 # ================= НАСТРОЙКИ =================
@@ -46,7 +46,10 @@ WATCH_INTERVAL = 300   # как часто проверять слежки (се
 MAX_WATCH = 15
 AUTO_INTERVAL = 3600   # автопоиск раз в час
 AUTO_N = 30
-PING_INTERVAL = 20     # самопинг, чтобы Render не усыплял (сек)
+PING_INTERVAL = 60     # самопинг, чтобы Render не усыплял (сек)
+CONFLICT_COUNT = 20     # сколько ошибок 409 за окно считать «токен используют ещё где-то»
+CONFLICT_WINDOW = 600   # окно (сек)
+CONFLICT_COOLDOWN = 1800  # не чаще одного предупреждения за это время (сек)
 MAX_TAKEN = 20000      # сколько занятых юзов помнить
 STATE_FILE = "state.json"
 DEFAULT_URL = "https://needit-li4n.onrender.com"
@@ -78,6 +81,8 @@ state = {
     "users": {},       # chat_id -> {"first", "last", "n"}
     "banned": [],
     "private": False,  # закрытый режим: только админ и ALLOWED
+    "maintenance": False,  # режим обслуживания: всем, кроме админа, «технические работы»
+    "maint_text": "",
 }
 taken = set()
 busy = set()
@@ -85,6 +90,8 @@ last_run = {}
 last_job = {}      # chat_id -> (title, фабрика, n) для кнопки «Ещё»
 last_found = {}    # chat_id -> последние найденные юзы
 errlog = deque(maxlen=30)
+conflicts = deque(maxlen=100)
+last_conflict_alert = [0.0]
 STARTED = time.time()
 
 HELP = (
@@ -111,8 +118,12 @@ ADMIN_HELP = (
     "/admin - панель с кнопками\n"
     "/broadcast текст - рассылка всем пользователям\n"
     "/ban ID, /unban ID - блокировка\n"
-    "/users - список пользователей"
+    "/users - список пользователей\n"
+    "/maintenance on|off [текст] - режим обслуживания"
 )
+
+
+MAINT_DEFAULT = "🛠 Технические работы. Бот скоро вернётся, попробуй чуть позже."
 
 
 def logerr(text):
@@ -184,6 +195,24 @@ def allowed(chat_id):
     if ALLOWED and chat_id not in ALLOWED:
         return False
     return True
+
+
+def maintenance_on():
+    with lock:
+        return state["maintenance"]
+
+
+def maint_message():
+    with lock:
+        return state.get("maint_text") or MAINT_DEFAULT
+
+
+def set_maintenance(on, text=""):
+    with lock:
+        state["maintenance"] = bool(on)
+        if on:
+            state["maint_text"] = text.strip()
+    save_state()
 
 
 def touch(chat_id):
@@ -264,12 +293,15 @@ def make_keyboard(chat_id, kind="main", plain=False):
     elif kind == "admin":
         with lock:
             priv = state["private"]
+            maint = state["maintenance"]
         rows.append([
             btn("Статистика", "adm:stats", "", "", "📊", plain),
             btn("Юзеры", "adm:users", "", "", "👥", plain),
         ])
         rows.append([btn("Закрытый доступ: %s" % ("вкл" if priv else "выкл"), "adm:private",
                          "success" if priv else "", "", "🔒" if priv else "🔓", plain)])
+        rows.append([btn("Обслуживание: %s" % ("вкл" if maint else "выкл"), "adm:maint",
+                         STYLE_CLEAR if maint else "", "", "🛠", plain)])
         rows.append([
             btn("Рассылка", "adm:bc", "", "", "📢", plain),
             btn("Бан", "adm:ban", "", "", "🚫", plain),
@@ -688,7 +720,7 @@ def auto_worker():
             chats = [int(c) for c, s in state["settings"].items() if s.get("auto")]
         for chat_id in chats:
             try:
-                if not allowed(chat_id):
+                if not allowed(chat_id) or (maintenance_on() and not is_admin(chat_id)):
                     continue
                 s = cfg(chat_id)
                 found, done, limited = scan(
@@ -724,6 +756,20 @@ def pinger():
         time.sleep(PING_INTERVAL)
 
 
+def note_conflict():
+    """409 Conflict = кто-то ещё читает сообщения этого же токена. Если это долго, предупреждаем админа."""
+    now = time.time()
+    conflicts.append(now)
+    recent = [t for t in conflicts if now - t < CONFLICT_WINDOW]
+    if len(recent) >= CONFLICT_COUNT and now - last_conflict_alert[0] > CONFLICT_COOLDOWN:
+        last_conflict_alert[0] = now
+        for a in ADMIN_IDS:
+            send(a, "⚠️ Похоже, твой токен используют ещё где-то (ошибка 409 повторяется %d раз за %d мин).\n\n"
+                    "Если ты только что обновлял бота на Render, подожди пару минут. "
+                    "Если нет, сделай /revoke в @BotFather и вставь новый токен в Render -> Environment (BOT_TOKEN)."
+                    % (len(recent), CONFLICT_WINDOW // 60))
+
+
 # ---------- админка ----------
 
 def fmt_uptime():
@@ -738,9 +784,10 @@ def admin_stats_text():
         day = sum(1 for u in users.values() if time.time() - u.get("last", 0) < 86400)
         return (
             "Статистика бота:\nПользователей: %d (за сутки: %d)\nПроверено: %d\nНайдено свободных: %d\n"
-            "Слежек: %d\nЗанятых в памяти: %d\nЗабанено: %d\nЗакрытый доступ: %s\nРаботаю: %s" % (
+            "Слежек: %d\nЗанятых в памяти: %d\nЗабанено: %d\nЗакрытый доступ: %s\nОбслуживание: %s\nРаботаю: %s" % (
                 len(users), day, st["checked"], st["found"], len(state["watches"]), len(taken),
-                len(state["banned"]), "вкл" if state["private"] else "выкл", fmt_uptime()))
+                len(state["banned"]), "вкл" if state["private"] else "выкл",
+                "вкл" if state["maintenance"] else "выкл", fmt_uptime()))
 
 
 def admin_users_text():
@@ -799,6 +846,17 @@ def admin_command(chat_id, cmd, parts, text):
         send(chat_id, "ID %d %s." % (uid, "заблокирован" if cmd == "/ban" else "разблокирован"))
     elif cmd == "/users":
         send(chat_id, admin_users_text())
+    elif cmd == "/maintenance":
+        bits = text.split(None, 2)
+        mode = bits[1].lower() if len(bits) > 1 else ""
+        if mode == "on":
+            set_maintenance(True, bits[2] if len(bits) > 2 else "")
+            send(chat_id, "🛠 Режим обслуживания включён. Остальным бот отвечает:\n\n" + maint_message())
+        elif mode == "off":
+            set_maintenance(False)
+            send(chat_id, "Режим обслуживания выключен, бот снова работает для всех.")
+        else:
+            send(chat_id, "Напиши так: /maintenance on [текст для пользователей] или /maintenance off")
 
 
 def admin_callback(cb_id, chat_id, mid, action):
@@ -820,6 +878,11 @@ def admin_callback(cb_id, chat_id, mid, action):
             now = state["private"]
         save_state()
         answer(cb_id, "Закрытый доступ: %s" % ("вкл" if now else "выкл"))
+        edit_keyboard(chat_id, mid, "admin")
+    elif action == "maint":
+        now = not maintenance_on()
+        set_maintenance(now)
+        answer(cb_id, "Обслуживание: %s" % ("вкл" if now else "выкл"))
         edit_keyboard(chat_id, mid, "admin")
     elif action == "bc":
         answer(cb_id)
@@ -882,8 +945,11 @@ def handle(msg):
     if not allowed(chat_id):
         send(chat_id, "Нет доступа. Твой ID: %d" % chat_id)
         return
+    if maintenance_on() and not is_admin(chat_id):
+        send(chat_id, maint_message())
+        return
 
-    if cmd in ("/admin", "/broadcast", "/ban", "/unban", "/users"):
+    if cmd in ("/admin", "/broadcast", "/ban", "/unban", "/users", "/maintenance"):
         if is_admin(chat_id):
             admin_command(chat_id, cmd, parts, text)
         return
@@ -994,6 +1060,9 @@ def handle_callback(cb):
     if not allowed(chat_id):
         answer(cb_id, "Нет доступа")
         return
+    if maintenance_on() and not is_admin(chat_id):
+        answer(cb_id, "Технические работы, попробуй позже")
+        return
     s = cfg(chat_id)
 
     if data.startswith("adm:"):
@@ -1069,7 +1138,7 @@ def keepalive():
 
 def main():
     if not TOKEN:
-        print("Нет токена")
+        print("Нет токена: добавь переменную BOT_TOKEN в Render -> Environment", flush=True)
         return
     load_state()
     keepalive()
@@ -1090,6 +1159,8 @@ def main():
             break
         except Exception as e:
             logerr("poll error: %s" % e)
+            if "409" in str(e):
+                note_conflict()
             time.sleep(5)
 
 
