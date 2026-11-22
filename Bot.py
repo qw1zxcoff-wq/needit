@@ -47,7 +47,7 @@ MAX_WATCH = 15
 AUTO_INTERVAL = 3600   # автопоиск раз в час
 AUTO_N = 30
 PING_INTERVAL = 60     # самопинг, чтобы Render не усыплял (сек)
-CONFLICT_COUNT = 20     # сколько ошибок 409 за окно считать «токен используют ещё где-то»
+CONFLICT_COUNT = 4      # сколько ошибок 409 за окно считать «токен используют ещё где-то»
 CONFLICT_WINDOW = 600   # окно (сек)
 CONFLICT_COOLDOWN = 1800  # не чаще одного предупреждения за это время (сек)
 MAX_TAKEN = 20000      # сколько занятых юзов помнить
@@ -100,6 +100,7 @@ HELP = (
     "/random [N] - случайные\n"
     "/mask a??ie - по маске (? = любая буква)\n"
     "/words [слова] - из списка слов или из твоих\n"
+    "/word слово [N] - варианты из одного слова (king: theking, kingx, k1ng...)\n"
     "/check имя - проверить один юз\n"
     "/len 8 - длина юза (5-12)\n"
     "/norep on|off - без повторяющихся букв\n"
@@ -444,6 +445,77 @@ def words_factory(names, shuffle):
     def f():
         lst = random.sample(names, len(names)) if shuffle else list(names)
         it = iter(lst)
+        return lambda: next(it, None)
+    return f
+
+
+TRANSLIT = {
+    "а": "a", "б": "b", "в": "v", "г": "g", "д": "d", "е": "e", "ё": "yo", "ж": "zh", "з": "z",
+    "и": "i", "й": "y", "к": "k", "л": "l", "м": "m", "н": "n", "о": "o", "п": "p", "р": "r",
+    "с": "s", "т": "t", "у": "u", "ф": "f", "х": "h", "ц": "c", "ч": "ch", "ш": "sh", "щ": "sh",
+    "ъ": "", "ы": "y", "ь": "", "э": "e", "ю": "yu", "я": "ya", "і": "i", "ї": "yi", "є": "ye", "ґ": "g",
+}
+PREFIXES = ["the", "my", "its", "real", "mr", "x", "i", "im", "get", "go", "just", "ur", "xx", "one"]
+SUFFIXES = ["x", "z", "o", "s", "y", "ly", "hq", "pro", "tv", "xd", "oo", "gg", "io", "max", "er", "ix", "real", "ok"]
+NUM_SUFFIXES = ["1", "7", "9", "01", "13", "21", "69", "99", "007", "123"]
+LEET = {"a": "4", "e": "3", "i": "1", "o": "0", "s": "5"}
+
+
+def translit(text):
+    """Русские/украинские буквы -> латиница, лишнее выкидываем."""
+    out = "".join(TRANSLIT.get(ch, ch) for ch in text.lower())
+    return re.sub(r"[^a-z0-9]", "", out)
+
+
+def word_variants(word):
+    """Варианты юзернейма на основе слова. Без повторов, только допустимые. Само слово идёт первым."""
+    seen, out = set(), []
+
+    def add(x):
+        if x not in seen and valid(x):
+            seen.add(x)
+            out.append(x)
+
+    w = word
+    add(w)
+    for p in PREFIXES:
+        add(p + w)
+    for x in SUFFIXES:
+        add(w + x)
+    for d in NUM_SUFFIXES:
+        add(w + d)
+    for x in ("x", "o", "z", "hq"):
+        add(w + "_" + x)
+    for p in ("x", "the", "my"):
+        add(p + "_" + w)
+    add(w + w[-1])
+    add(w[0] + w)
+    for v in "aeiouy":
+        add(w + v)
+    for i, ch in enumerate(w):
+        if ch in VOWELS:
+            for v in VOWELS:
+                if v != ch:
+                    add(w[:i] + v + w[i + 1:])
+            if i > 0:
+                add(w[:i] + w[i + 1:])
+        if ch in LEET:
+            add(w[:i] + LEET[ch] + w[i + 1:])
+    add("".join(LEET.get(ch, ch) for ch in w))
+    for i in range(len(w) - 1):
+        if w[i] != w[i + 1]:
+            add(w[:i] + w[i + 1] + w[i] + w[i + 2:])
+    return out
+
+
+def word_factory(word):
+    def f():
+        with lock:
+            cand = [v for v in word_variants(word) if v not in taken]
+        first = cand[:1] if cand and cand[0] == word else []
+        rest = cand[len(first):]
+        random.shuffle(rest)
+        it = iter(first + rest)
         return lambda: next(it, None)
     return f
 
@@ -990,6 +1062,18 @@ def handle(msg):
             start_search(chat_id, "Слова", words_factory(names, False), len(names))
         else:
             start_search(chat_id, "Слова", words_factory(WORDS, True), DEFAULT_N)
+    elif cmd == "/word":
+        word = translit(parts[1]) if len(parts) > 1 else ""
+        if not word or len(word) > 20:
+            send(chat_id, "Напиши так: /word king [N] - варианты юзернейма из слова (можно русскими буквами).")
+            return
+        cands = word_variants(word)
+        if not cands:
+            send(chat_id, "Из этого слова не получается допустимых юзернеймов.")
+            return
+        n = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else DEFAULT_N
+        n = max(1, min(n, MAX_N, len(cands)))
+        start_search(chat_id, "Слово «%s»" % word, word_factory(word), n)
     elif cmd == "/len":
         if len(parts) > 1 and parts[1].isdigit() and MIN_LEN <= int(parts[1]) <= MAX_LEN:
             s["length"] = int(parts[1])
