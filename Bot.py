@@ -46,7 +46,7 @@ WATCH_INTERVAL = 300   # как часто проверять слежки (се
 MAX_WATCH = 15
 AUTO_INTERVAL = 3600   # автопоиск раз в час
 AUTO_N = 30
-PING_INTERVAL = 60     # самопинг, чтобы Render не усыплял (сек)
+PING_INTERVAL = 20     # самопинг, чтобы Render не усыплял (сек)
 CONFLICT_COUNT = 4      # сколько ошибок 409 за окно считать «токен используют ещё где-то»
 CONFLICT_WINDOW = 600   # окно (сек)
 CONFLICT_COOLDOWN = 1800  # не чаще одного предупреждения за это время (сек)
@@ -89,6 +89,7 @@ busy = set()
 last_run = {}
 last_job = {}      # chat_id -> (title, фабрика, n) для кнопки «Ещё»
 last_found = {}    # chat_id -> последние найденные юзы
+rare_shown = set()  # редкие юзы, которые уже показывали (чтобы не повторять)
 errlog = deque(maxlen=30)
 conflicts = deque(maxlen=100)
 last_conflict_alert = [0.0]
@@ -120,7 +121,8 @@ ADMIN_HELP = (
     "/broadcast текст - рассылка всем пользователям\n"
     "/ban ID, /unban ID - блокировка\n"
     "/users - список пользователей\n"
-    "/maintenance on|off [текст] - режим обслуживания"
+    "/maintenance on|off [текст] - режим обслуживания\n"
+    "/rare [N] - поиск редких юзов (5 букв, без цифр и _, читаемые)"
 )
 
 
@@ -299,6 +301,7 @@ def make_keyboard(chat_id, kind="main", plain=False):
             btn("Статистика", "adm:stats", "", "", "📊", plain),
             btn("Юзеры", "adm:users", "", "", "👥", plain),
         ])
+        rows.append([btn("Редкие юзы (5 букв)", "adm:rare", STYLE_FIND, "", "💎", plain)])
         rows.append([btn("Закрытый доступ: %s" % ("вкл" if priv else "выкл"), "adm:private",
                          "success" if priv else "", "", "🔒" if priv else "🔓", plain)])
         rows.append([btn("Обслуживание: %s" % ("вкл" if maint else "выкл"), "adm:maint",
@@ -520,6 +523,61 @@ def word_factory(word):
     return f
 
 
+# ---------- редкие юзы (только для админа) ----------
+# Критерии: ровно 5 символов, только буквы (без цифр и _), легко читаются, буквы не повторяются.
+# «Редкость» это оценка бота по редким буквам, а не официальные данные Telegram.
+RCONS = CONS.replace("q", "")
+CLUSTERS = ["st", "nd", "rk", "rt", "lm", "lk", "sk", "mb", "nt", "rn", "lv", "rv", "ld", "mp"]
+LETTER_W = {"e": 1, "t": 1, "a": 1, "o": 1, "i": 1, "n": 1, "s": 1, "r": 1, "h": 1, "l": 1, "d": 1,
+            "c": 2, "u": 2, "m": 2, "w": 3, "f": 2, "g": 2, "y": 3, "p": 2, "b": 2,
+            "v": 3, "k": 3, "j": 4, "x": 4, "z": 4}
+
+
+def gen_rare_candidate():
+    pattern = random.choice(("CVCVC", "VCVCV", "CVKV"))
+    parts = []
+    for ch in pattern:
+        if ch == "C":
+            parts.append(random.choice(RCONS))
+        elif ch == "V":
+            parts.append(random.choice(VOWELS))
+        else:
+            parts.append(random.choice(CLUSTERS))
+    return "".join(parts)
+
+
+def rare_score(name):
+    sc = sum(LETTER_W.get(c, 1) for c in name)
+    if name[0] in VOWELS:
+        sc += 2
+    return sc
+
+
+def rare_stars(score):
+    return 1 + sum(score >= t for t in (9, 11, 13, 15))
+
+
+def rare_factory():
+    def f():
+        with lock:
+            skip = set(taken)
+        skip |= rare_shown
+        pool, tries = set(), 0
+        while len(pool) < 500 and tries < 20000:
+            tries += 1
+            nm = gen_rare_candidate()
+            if len(set(nm)) == len(nm) and nm not in skip:
+                pool.add(nm)
+        ranked = sorted(pool, key=lambda x: rare_score(x) + random.random() * 2, reverse=True)
+        it = iter(ranked)
+        return lambda: next(it, None)
+    return f
+
+
+def launch_rare(chat_id, n=DEFAULT_N):
+    start_search(chat_id, "💎 Редкие по 5 (читаемые, без цифр и _)", rare_factory(), n, rank=rare_score)
+
+
 def check(name):
     """True = похоже свободен, False = занят, None = ошибка/лимит"""
     req = urllib.request.Request(
@@ -604,7 +662,7 @@ def progress_text(title, done, n, found_cnt):
     return "%s\n%s %d/%d\nНайдено: %d" % (title, "▓" * filled + "░" * (10 - filled), done, n, found_cnt)
 
 
-def search(chat_id, title, make_next, n):
+def search(chat_id, title, make_next, n, rank=None):
     try:
         mid = send_msg(chat_id, progress_text(title, 0, n, 0))
         plock = threading.Lock()
@@ -621,10 +679,13 @@ def search(chat_id, title, make_next, n):
             edit_text(chat_id, mid, progress_text(title, done, n, found_cnt))
 
         found, done, limited = scan(make_next(), n, on_progress)
+        if rank:
+            found.sort(key=rank, reverse=True)
+            rare_shown.update(found)
         last_found[chat_id] = list(found)
         if found:
-            text = "%s\nПохоже свободны (%d из %d):\n%s" % (
-                title, len(found), done, "\n".join("@" + x for x in found))
+            lines = [("@%s %s" % (x, "💎" * rare_stars(rank(x)))) if rank else "@" + x for x in found]
+            text = "%s\nПохоже свободны (%d из %d):\n%s" % (title, len(found), done, "\n".join(lines))
         else:
             text = "%s\nПроверено %d, свободных не нашлось. Попробуй ещё раз." % (title, done)
         if limited:
@@ -636,7 +697,7 @@ def search(chat_id, title, make_next, n):
         busy.discard(chat_id)
 
 
-def start_search(chat_id, title, make_next, n):
+def start_search(chat_id, title, make_next, n, rank=None):
     if chat_id in busy:
         send(chat_id, "Поиск уже идёт, дождись результата.")
         return
@@ -645,9 +706,9 @@ def start_search(chat_id, title, make_next, n):
         send(chat_id, "Подожди ещё %d сек." % int(wait))
         return
     last_run[chat_id] = time.time()
-    last_job[chat_id] = (title, make_next, n)
+    last_job[chat_id] = (title, make_next, n, rank)
     busy.add(chat_id)
-    threading.Thread(target=search, args=(chat_id, title, make_next, n), daemon=True).start()
+    threading.Thread(target=search, args=(chat_id, title, make_next, n, rank), daemon=True).start()
 
 
 def launch(chat_id, kind, length=None, n=DEFAULT_N):
@@ -918,6 +979,9 @@ def admin_command(chat_id, cmd, parts, text):
         send(chat_id, "ID %d %s." % (uid, "заблокирован" if cmd == "/ban" else "разблокирован"))
     elif cmd == "/users":
         send(chat_id, admin_users_text())
+    elif cmd == "/rare":
+        n = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else DEFAULT_N
+        launch_rare(chat_id, max(1, min(n, MAX_N)))
     elif cmd == "/maintenance":
         bits = text.split(None, 2)
         mode = bits[1].lower() if len(bits) > 1 else ""
@@ -951,6 +1015,9 @@ def admin_callback(cb_id, chat_id, mid, action):
         save_state()
         answer(cb_id, "Закрытый доступ: %s" % ("вкл" if now else "выкл"))
         edit_keyboard(chat_id, mid, "admin")
+    elif action == "rare":
+        answer(cb_id)
+        launch_rare(chat_id)
     elif action == "maint":
         now = not maintenance_on()
         set_maintenance(now)
@@ -1021,7 +1088,7 @@ def handle(msg):
         send(chat_id, maint_message())
         return
 
-    if cmd in ("/admin", "/broadcast", "/ban", "/unban", "/users", "/maintenance"):
+    if cmd in ("/admin", "/broadcast", "/ban", "/unban", "/users", "/maintenance", "/rare"):
         if is_admin(chat_id):
             admin_command(chat_id, cmd, parts, text)
         return
