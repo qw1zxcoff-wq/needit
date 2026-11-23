@@ -4,6 +4,7 @@ import os
 import random
 import re
 import string
+import tempfile
 import threading
 import time
 import urllib.error
@@ -46,7 +47,7 @@ WATCH_INTERVAL = 300   # как часто проверять слежки (се
 MAX_WATCH = 15
 AUTO_INTERVAL = 3600   # автопоиск раз в час
 AUTO_N = 30
-PING_INTERVAL = 20     # самопинг, чтобы Render не усыплял (сек)
+PING_INTERVAL = 60     # самопинг, чтобы Render не усыплял (сек)
 CONFLICT_COUNT = 4      # сколько ошибок 409 за окно считать «токен используют ещё где-то»
 CONFLICT_WINDOW = 600   # окно (сек)
 CONFLICT_COOLDOWN = 1800  # не чаще одного предупреждения за это время (сек)
@@ -122,7 +123,8 @@ ADMIN_HELP = (
     "/ban ID, /unban ID - блокировка\n"
     "/users - список пользователей\n"
     "/maintenance on|off [текст] - режим обслуживания\n"
-    "/rare [N] - поиск редких юзов (5 букв, без цифр и _, читаемые)"
+    "/rare [N] - поиск редких юзов (5 букв, без цифр и _, читаемые)\n"
+    "/sc ссылка - скачать трек с SoundCloud (или просто пришли ссылку). Только треки, которые автор разрешил скачивать"
 )
 
 
@@ -903,6 +905,104 @@ def note_conflict():
                     % (len(recent), CONFLICT_WINDOW // 60))
 
 
+# ---------- SoundCloud (только админ) ----------
+# Скачивает только треки, у которых автор включил официальную кнопку «Download file».
+# Остальное не обходим. Нужен yt-dlp (Render: requirements.txt, Pydroid: pip install yt-dlp).
+SC_RE = re.compile(r"https?://(?:www\.|m\.|on\.)?soundcloud\.com/\S+", re.I)
+SC_MAX_BYTES = 49 * 1024 * 1024  # лимит Telegram для файлов от бота ~50 МБ
+sc_busy = set()
+
+
+def multipart_send(method, field, chat_id, path, extra=None):
+    boundary = "----tgbot%d" % int(time.time() * 1000)
+    fields = {"chat_id": str(chat_id)}
+    fields.update(extra or {})
+    body = bytearray()
+    for k, v in fields.items():
+        if v:
+            body += ('--%s\r\nContent-Disposition: form-data; name="%s"\r\n\r\n%s\r\n' % (boundary, k, v)).encode("utf-8")
+    ext = os.path.splitext(path)[1] or ".bin"
+    body += ('--%s\r\nContent-Disposition: form-data; name="%s"; filename="track%s"\r\n'
+             "Content-Type: application/octet-stream\r\n\r\n" % (boundary, field, ext)).encode("utf-8")
+    with open(path, "rb") as f:
+        body += f.read()
+    body += ("\r\n--%s--\r\n" % boundary).encode("utf-8")
+    req = urllib.request.Request(API + method, data=bytes(body),
+                                 headers={"Content-Type": "multipart/form-data; boundary=%s" % boundary})
+    with urllib.request.urlopen(req, timeout=300) as r:
+        return json.loads(r.read().decode("utf-8"))
+
+
+def sc_fetch(url, tmpdir):
+    """Возвращает (путь, название, автор, ошибка)."""
+    try:
+        import yt_dlp
+    except ImportError:
+        return None, "", "", "Не установлен yt-dlp. Добавь его в requirements.txt (Render) или pip install yt-dlp (Pydroid)."
+    base = {"quiet": True, "no_warnings": True, "noplaylist": True}
+    try:
+        with yt_dlp.YoutubeDL(base) as ydl:
+            info = ydl.extract_info(url, download=False)
+    except Exception as e:
+        return None, "", "", "Не удалось открыть трек: %s" % str(e)[:150]
+    if not info or info.get("_type") == "playlist" or info.get("entries"):
+        return None, "", "", "Плейлисты и профили не поддерживаю, пришли ссылку на один трек."
+    title = info.get("title") or "track"
+    performer = info.get("uploader") or ""
+    if not any(f.get("format_id") == "download" for f in (info.get("formats") or [])):
+        return None, title, performer, ("Автор не разрешил скачивание этого трека "
+                                        "(на SoundCloud нет кнопки «Download file»). Такие треки я не скачиваю.")
+    opts = dict(base, format="download", outtmpl=os.path.join(tmpdir, "track.%(ext)s"))
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            ydl.download([url])
+    except Exception as e:
+        return None, title, performer, "Ошибка скачивания: %s" % str(e)[:150]
+    files = [os.path.join(tmpdir, f) for f in os.listdir(tmpdir)]
+    if not files:
+        return None, title, performer, "Файл не скачался."
+    path = max(files, key=os.path.getsize)
+    if os.path.getsize(path) > SC_MAX_BYTES:
+        return None, title, performer, "Файл больше 50 МБ, Telegram не даст его отправить."
+    return path, title, performer, ""
+
+
+def sc_job(chat_id, url):
+    mid = None
+    try:
+        mid = send_msg(chat_id, "⏳ Проверяю трек...")
+        with tempfile.TemporaryDirectory() as tmp:
+            path, title, performer, err = sc_fetch(url, tmp)
+            if err:
+                text = "⚠️ " + err
+                if not (mid and edit_text(chat_id, mid, text)):
+                    send(chat_id, text)
+                return
+            if mid:
+                edit_text(chat_id, mid, "⬆️ Отправляю: %s" % title)
+            try:
+                multipart_send("sendAudio", "audio", chat_id, path,
+                               {"title": title[:64], "performer": performer[:64]})
+            except Exception as e:
+                logerr("sendAudio error: %s, пробую как документ" % e)
+                multipart_send("sendDocument", "document", chat_id, path)
+            if mid:
+                edit_text(chat_id, mid, "✅ Готово: %s" % title)
+    except Exception as e:
+        logerr("sc error: %s" % e)
+        send(chat_id, "⚠️ Не получилось отправить трек: %s" % str(e)[:150])
+    finally:
+        sc_busy.discard(chat_id)
+
+
+def start_sc(chat_id, url):
+    if chat_id in sc_busy:
+        send(chat_id, "Уже качаю трек, подожди.")
+        return
+    sc_busy.add(chat_id)
+    threading.Thread(target=sc_job, args=(chat_id, url), daemon=True).start()
+
+
 # ---------- админка ----------
 
 def fmt_uptime():
@@ -979,6 +1079,12 @@ def admin_command(chat_id, cmd, parts, text):
         send(chat_id, "ID %d %s." % (uid, "заблокирован" if cmd == "/ban" else "разблокирован"))
     elif cmd == "/users":
         send(chat_id, admin_users_text())
+    elif cmd == "/sc":
+        m = SC_RE.search(text)
+        if m:
+            start_sc(chat_id, m.group(0))
+        else:
+            send(chat_id, "Напиши так: /sc https://soundcloud.com/... (или просто пришли ссылку).")
     elif cmd == "/rare":
         n = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else DEFAULT_N
         launch_rare(chat_id, max(1, min(n, MAX_N)))
@@ -1074,6 +1180,9 @@ def handle(msg):
 
     text = (msg.get("text") or "").strip()
     if not text.startswith("/"):
+        m = SC_RE.search(text)
+        if m and is_admin(chat_id):
+            start_sc(chat_id, m.group(0))
         return
     parts = text.split()
     cmd = parts[0].split("@")[0].lower()
@@ -1088,7 +1197,7 @@ def handle(msg):
         send(chat_id, maint_message())
         return
 
-    if cmd in ("/admin", "/broadcast", "/ban", "/unban", "/users", "/maintenance", "/rare"):
+    if cmd in ("/admin", "/broadcast", "/ban", "/unban", "/users", "/maintenance", "/rare", "/sc"):
         if is_admin(chat_id):
             admin_command(chat_id, cmd, parts, text)
         return
