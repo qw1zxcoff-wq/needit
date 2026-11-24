@@ -4,7 +4,6 @@ import os
 import random
 import re
 import string
-import tempfile
 import threading
 import time
 import urllib.error
@@ -35,7 +34,15 @@ ICON_RAND = ""
 # Если задать ALLOWED_IDS в Render (через запятую), пользоваться ботом смогут только они и админ.
 ALLOWED = {int(x) for x in os.environ.get("ALLOWED_IDS", "").replace(" ", "").split(",") if x.isdigit()}
 
-DELAY = 1.2            # пауза каждого потока между проверками (сек)
+DELAY = 1.2            # минимальная пауза каждого потока между проверками (сек)
+DELAY_MAX = 12.0       # максимальная пауза при лимитах t.me (адаптивная скорость)
+BACKOFF_START = 15     # первая общая пауза после лимита 429 (сек), дальше удваивается
+BACKOFF_MAX = 180      # максимум общей паузы (сек)
+SPEEDUP_AFTER = 20     # после стольких удачных проверок подряд бот чуть ускоряется
+LIMIT_STOP = 12        # сколько ответов-лимитов за один поиск терпим, потом останавливаем поиск
+FRAGMENT_CHECK = True  # проверять найденные юзы на Fragment (продаются ли они там)
+FRAG_MAX = 25          # сколько найденных юзов проверять на Fragment за один поиск
+FRAG_DELAY = 0.8       # пауза между запросами к Fragment (сек)
 WORKERS = 4            # потоков проверки
 DEFAULT_N = 20
 MAX_N = 60
@@ -47,7 +54,7 @@ WATCH_INTERVAL = 300   # как часто проверять слежки (се
 MAX_WATCH = 15
 AUTO_INTERVAL = 3600   # автопоиск раз в час
 AUTO_N = 30
-PING_INTERVAL = 40     # самопинг, чтобы Render не усыплял (сек)
+PING_INTERVAL = 35     # самопинг, чтобы Render не усыплял (сек)
 CONFLICT_COUNT = 4      # сколько ошибок 409 за окно считать «токен используют ещё где-то»
 CONFLICT_WINDOW = 600   # окно (сек)
 CONFLICT_COOLDOWN = 1800  # не чаще одного предупреждения за это время (сек)
@@ -92,6 +99,8 @@ last_job = {}      # chat_id -> (title, фабрика, n) для кнопки �
 last_found = {}    # chat_id -> последние найденные юзы
 rare_shown = set()  # редкие юзы, которые уже показывали (чтобы не повторять)
 errlog = deque(maxlen=30)
+slock = threading.Lock()
+speed = {"delay": DELAY, "until": 0.0, "backoff": BACKOFF_START, "ok": 0, "limits": 0, "last_limit": 0.0}
 conflicts = deque(maxlen=100)
 last_conflict_alert = [0.0]
 STARTED = time.time()
@@ -103,6 +112,7 @@ HELP = (
     "/mask a??ie - по маске (? = любая буква)\n"
     "/words [слова] - из списка слов или из твоих\n"
     "/word слово [N] - варианты из одного слова (king: theking, kingx, k1ng...)\n"
+    "/fragment имя - есть ли юз на Fragment (продаётся, аукцион, продан)\n"
     "/check имя - проверить один юз\n"
     "/len 8 - длина юза (5-12)\n"
     "/norep on|off - без повторяющихся букв\n"
@@ -123,8 +133,7 @@ ADMIN_HELP = (
     "/ban ID, /unban ID - блокировка\n"
     "/users - список пользователей\n"
     "/maintenance on|off [текст] - режим обслуживания\n"
-    "/rare [N] - поиск редких юзов (5 букв, без цифр и _, читаемые)\n"
-    "/sc ссылка - скачать трек с SoundCloud (или просто пришли ссылку). Только треки, которые автор разрешил скачивать"
+    "/rare [N] - поиск редких юзов (5 букв, без цифр и _, читаемые)"
 )
 
 
@@ -580,8 +589,69 @@ def launch_rare(chat_id, n=DEFAULT_N):
     start_search(chat_id, "💎 Редкие по 5 (читаемые, без цифр и _)", rare_factory(), n, rank=rare_score)
 
 
+# ---------- адаптивная скорость ----------
+# При лимите 429 от t.me все потоки ждут общую паузу (она растёт: 15, 30, 60... сек),
+# а обычная задержка между проверками увеличивается. После серии удачных ответов бот снова ускоряется.
+
+def current_delay():
+    with slock:
+        return speed["delay"] * random.uniform(0.9, 1.2)
+
+
+def speed_wait():
+    while True:
+        with slock:
+            wait = speed["until"] - time.time()
+        if wait <= 0:
+            return
+        time.sleep(min(wait, 2))
+
+
+def speed_limit():
+    with slock:
+        now = time.time()
+        speed["limits"] += 1
+        speed["last_limit"] = now
+        speed["ok"] = 0
+        if now >= speed["until"]:  # несколько потоков могли поймать один и тот же лимит
+            speed["until"] = now + speed["backoff"]
+            wait = speed["backoff"]
+            speed["backoff"] = min(speed["backoff"] * 2, BACKOFF_MAX)
+            speed["delay"] = min(speed["delay"] * 1.6, DELAY_MAX)
+        else:
+            wait = speed["until"] - now
+        delay = speed["delay"]
+    logerr("t.me: лимит 429, общая пауза %d сек, задержка теперь %.1f сек" % (wait, delay))
+
+
+def speed_ok():
+    with slock:
+        speed["ok"] += 1
+        if speed["ok"] >= SPEEDUP_AFTER:
+            speed["ok"] = 0
+            speed["delay"] = max(DELAY, speed["delay"] * 0.85)
+            speed["backoff"] = max(BACKOFF_START, speed["backoff"] / 2)
+
+
+def recently_limited(seconds=5):
+    with slock:
+        return time.time() - speed["last_limit"] < seconds
+
+
+def speed_note():
+    with slock:
+        waiting = speed["until"] - time.time()
+        delay = speed["delay"]
+    if waiting > 0:
+        return "\n🐢 t.me ограничил запросы, жду %d сек" % max(1, int(waiting))
+    if delay > DELAY * 1.5:
+        return "\n🐢 t.me притормаживает, иду медленнее (пауза %.1f сек)" % delay
+    return ""
+
+
 def check(name):
     """True = похоже свободен, False = занят, None = ошибка/лимит"""
+    speed_wait()
     req = urllib.request.Request(
         "https://t.me/" + name,
         headers={"User-Agent": "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36"},
@@ -591,12 +661,86 @@ def check(name):
             html = r.read().decode("utf-8", errors="ignore")
     except urllib.error.HTTPError as e:
         if e.code == 429:
-            logerr("t.me: лимит 429, жду 30 сек")
-            time.sleep(30)
+            speed_limit()
         return None
     except Exception:
         return None
+    speed_ok()
     return "tgme_page_title" not in html
+
+
+# ---------- Fragment ----------
+# Юзы, выставленные на Fragment, t.me показывает как «свободные», хотя занять их обычным способом нельзя.
+FRAG_STATUS_RE = re.compile(r'tm-section-header-status[^>]*>\s*([^<]+?)\s*<', re.I)
+
+
+def fragment_status(name):
+    """Возвращает (код, текст статуса).
+    Коды: none (на Fragment нет), listed (продаётся/аукцион/доступен), sold, taken (занят, не продаётся),
+    other (непонятный статус, текст показываем как есть), None (не удалось проверить)."""
+    req = urllib.request.Request(
+        "https://fragment.com/username/" + name,
+        headers={"User-Agent": "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36",
+                 "Accept-Language": "en-US,en;q=0.8"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=12) as r:
+            html = r.read().decode("utf-8", errors="ignore")
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            return "none", ""
+        return None, "HTTP %d" % e.code
+    except Exception as e:
+        return None, str(e)[:60]
+    m = FRAG_STATUS_RE.search(html)
+    if not m:
+        return "none", ""
+    raw = m.group(1).strip()
+    low = raw.lower()
+    if "sold" in low:
+        return "sold", raw
+    if "unavail" in low or "taken" in low or "claimed" in low:
+        return "taken", raw
+    if "auction" in low or "sale" in low or "avail" in low:
+        return "listed", raw
+    return "other", raw
+
+
+def frag_text(name, code, raw):
+    if code == "none":
+        return "Fragment: нет в продаже"
+    if code in ("listed", "other"):
+        return "🛒 Fragment: %s (fragment.com/username/%s)" % (raw, name)
+    if code in ("sold", "taken"):
+        return "Fragment: %s (занят, купить нельзя)" % raw
+    return "Fragment: не удалось проверить"
+
+
+def mark_taken(name):
+    with lock:
+        taken.add(name)
+
+
+def fragment_split(names):
+    """Делит найденные юзы: (свободные, [(юз, статус)] на Fragment, непроверенные, сколько исключено)."""
+    free, listed, unchecked, excluded = [], [], [], 0
+    for i, x in enumerate(names):
+        if i >= FRAG_MAX:
+            unchecked.append(x)
+            continue
+        code, raw = fragment_status(x)
+        time.sleep(FRAG_DELAY)
+        if code == "none":
+            free.append(x)
+        elif code in ("listed", "other"):
+            listed.append((x, raw))
+            mark_taken(x)
+        elif code in ("sold", "taken"):
+            excluded += 1
+            mark_taken(x)
+        else:
+            unchecked.append(x)
+    return free, listed, unchecked, excluded
 
 
 def record(name, res, cached):
@@ -611,7 +755,7 @@ def record(name, res, cached):
 def scan(next_name, n, progress=None):
     """Проверяет до n юзов в несколько потоков. Возвращает (найдено, проверено, упёрлись_в_лимит)."""
     found = []
-    ctl = {"picked": 0, "done": 0, "errors": 0, "attempts": 0}
+    ctl = {"picked": 0, "done": 0, "errors": 0, "limits": 0, "attempts": 0}
     seen = set()
     glock = threading.Lock()
     max_attempts = n * 30 + 100
@@ -619,7 +763,8 @@ def scan(next_name, n, progress=None):
     def worker():
         while True:
             with glock:
-                if ctl["picked"] >= n or ctl["errors"] >= 6 or ctl["attempts"] >= max_attempts:
+                if (ctl["picked"] >= n or ctl["errors"] >= 6 or ctl["limits"] >= LIMIT_STOP
+                        or ctl["attempts"] >= max_attempts):
                     return
                 ctl["attempts"] += 1
                 name = next_name()
@@ -635,11 +780,14 @@ def scan(next_name, n, progress=None):
                 res = False
             else:
                 res = check(name)
-                time.sleep(DELAY)
+                time.sleep(current_delay())
             with glock:
                 if res is None:
                     ctl["picked"] -= 1
-                    ctl["errors"] += 1
+                    if recently_limited():
+                        ctl["limits"] += 1  # лимит t.me: бот сам подождёт и замедлится
+                    else:
+                        ctl["errors"] += 1
                     continue
                 ctl["errors"] = 0
                 ctl["done"] += 1
@@ -656,12 +804,12 @@ def scan(next_name, n, progress=None):
     with ThreadPoolExecutor(max_workers=WORKERS) as ex:
         for _ in range(WORKERS):
             ex.submit(worker)
-    return found, ctl["done"], ctl["errors"] >= 6
+    return found, ctl["done"], ctl["errors"] >= 6 or ctl["limits"] >= LIMIT_STOP
 
 
 def progress_text(title, done, n, found_cnt):
     filled = int(10 * done / n) if n else 0
-    return "%s\n%s %d/%d\nНайдено: %d" % (title, "▓" * filled + "░" * (10 - filled), done, n, found_cnt)
+    return "%s\n%s %d/%d\nНайдено: %d%s" % (title, "▓" * filled + "░" * (10 - filled), done, n, found_cnt, speed_note())
 
 
 def search(chat_id, title, make_next, n, rank=None):
@@ -684,14 +832,29 @@ def search(chat_id, title, make_next, n, rank=None):
         if rank:
             found.sort(key=rank, reverse=True)
             rare_shown.update(found)
-        last_found[chat_id] = list(found)
-        if found:
-            lines = [("@%s %s" % (x, "💎" * rare_stars(rank(x)))) if rank else "@" + x for x in found]
-            text = "%s\nПохоже свободны (%d из %d):\n%s" % (title, len(found), done, "\n".join(lines))
+        free_names, listed, unchecked, excluded = list(found), [], [], 0
+        if FRAGMENT_CHECK and found:
+            if mid:
+                edit_text(chat_id, mid, "%s\nПроверяю на Fragment: %d юз..." % (title, min(len(found), FRAG_MAX)))
+            free_names, listed, unchecked, excluded = fragment_split(found)
+        last_found[chat_id] = list(free_names) + list(unchecked)
+        blocks = []
+        if free_names:
+            lines = [("@%s %s" % (x, "💎" * rare_stars(rank(x)))) if rank else "@" + x for x in free_names]
+            blocks.append("✅ Свободны (%d):\n%s" % (len(free_names), "\n".join(lines)))
+        if listed:
+            blocks.append("🛒 На Fragment (%d):\n%s" % (
+                len(listed), "\n".join("@%s - %s" % (x, raw) for x, raw in listed)))
+        if unchecked:
+            blocks.append("⚠️ Fragment не проверил (могут быть свободны):\n%s" % "\n".join("@" + x for x in unchecked))
+        if excluded:
+            blocks.append("Исключено: %d (уже куплены на Fragment)." % excluded)
+        if blocks:
+            text = "%s\nПроверено %d, по t.me свободно %d.\n\n%s" % (title, done, len(found), "\n\n".join(blocks))
         else:
             text = "%s\nПроверено %d, свободных не нашлось. Попробуй ещё раз." % (title, done)
         if limited:
-            text += "\n\nt.me часто не отвечает, остановился. Попробуй позже."
+            text += "\n\nt.me ограничивает запросы, поиск остановлен. Попробуй через несколько минут: бот сам замедлился."
         save_state()
         if not (mid and edit_text(chat_id, mid, text, "result")):
             send(chat_id, text, "result")
@@ -836,15 +999,21 @@ def watcher():
             names = list(state["watches"].keys())
         for name in names:
             res = check(name)
-            time.sleep(DELAY)
+            time.sleep(current_delay())
             if res:
                 time.sleep(10)
                 if check(name) is True:  # перепроверка против ложной тревоги
+                    code, raw = fragment_status(name)
+                    if code in ("sold", "taken"):
+                        continue  # он на Fragment как занятый коллекционный, продолжаем следить
                     with lock:
                         chats = list(state["watches"].pop(name, []))
                     save_state()
+                    note = ""
+                    if code in ("listed", "other"):
+                        note = "\n🛒 Но он на Fragment: %s (fragment.com/username/%s). Обычным способом его не занять." % (raw, name)
                     for c in chats:
-                        send(c, "🔔 @%s похоже освободился! Проверь и займи как можно быстрее." % name)
+                        send(c, "🔔 @%s похоже освободился! Проверь и займи как можно быстрее.%s" % (name, note))
         time.sleep(WATCH_INTERVAL)
 
 
@@ -860,6 +1029,9 @@ def auto_worker():
                 s = cfg(chat_id)
                 found, done, limited = scan(
                     lambda: make_name("find", s["length"], s["norep"], s["charset"]), AUTO_N)
+                if FRAGMENT_CHECK and found:
+                    free_names, listed, unchecked, excluded = fragment_split(found)
+                    found = free_names + unchecked
                 with lock:
                     sent = state["sent"].setdefault(str(chat_id), [])
                     new = [x for x in found if x not in sent]
@@ -905,104 +1077,6 @@ def note_conflict():
                     % (len(recent), CONFLICT_WINDOW // 60))
 
 
-# ---------- SoundCloud (только админ) ----------
-# Скачивает только треки, у которых автор включил официальную кнопку «Download file».
-# Остальное не обходим. Нужен yt-dlp (Render: requirements.txt, Pydroid: pip install yt-dlp).
-SC_RE = re.compile(r"https?://(?:www\.|m\.|on\.)?soundcloud\.com/\S+", re.I)
-SC_MAX_BYTES = 49 * 1024 * 1024  # лимит Telegram для файлов от бота ~50 МБ
-sc_busy = set()
-
-
-def multipart_send(method, field, chat_id, path, extra=None):
-    boundary = "----tgbot%d" % int(time.time() * 1000)
-    fields = {"chat_id": str(chat_id)}
-    fields.update(extra or {})
-    body = bytearray()
-    for k, v in fields.items():
-        if v:
-            body += ('--%s\r\nContent-Disposition: form-data; name="%s"\r\n\r\n%s\r\n' % (boundary, k, v)).encode("utf-8")
-    ext = os.path.splitext(path)[1] or ".bin"
-    body += ('--%s\r\nContent-Disposition: form-data; name="%s"; filename="track%s"\r\n'
-             "Content-Type: application/octet-stream\r\n\r\n" % (boundary, field, ext)).encode("utf-8")
-    with open(path, "rb") as f:
-        body += f.read()
-    body += ("\r\n--%s--\r\n" % boundary).encode("utf-8")
-    req = urllib.request.Request(API + method, data=bytes(body),
-                                 headers={"Content-Type": "multipart/form-data; boundary=%s" % boundary})
-    with urllib.request.urlopen(req, timeout=300) as r:
-        return json.loads(r.read().decode("utf-8"))
-
-
-def sc_fetch(url, tmpdir):
-    """Возвращает (путь, название, автор, ошибка)."""
-    try:
-        import yt_dlp
-    except ImportError:
-        return None, "", "", "Не установлен yt-dlp. Добавь его в requirements.txt (Render) или pip install yt-dlp (Pydroid)."
-    base = {"quiet": True, "no_warnings": True, "noplaylist": True}
-    try:
-        with yt_dlp.YoutubeDL(base) as ydl:
-            info = ydl.extract_info(url, download=False)
-    except Exception as e:
-        return None, "", "", "Не удалось открыть трек: %s" % str(e)[:150]
-    if not info or info.get("_type") == "playlist" or info.get("entries"):
-        return None, "", "", "Плейлисты и профили не поддерживаю, пришли ссылку на один трек."
-    title = info.get("title") or "track"
-    performer = info.get("uploader") or ""
-    if not any(f.get("format_id") == "download" for f in (info.get("formats") or [])):
-        return None, title, performer, ("Автор не разрешил скачивание этого трека "
-                                        "(на SoundCloud нет кнопки «Download file»). Такие треки я не скачиваю.")
-    opts = dict(base, format="download", outtmpl=os.path.join(tmpdir, "track.%(ext)s"))
-    try:
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            ydl.download([url])
-    except Exception as e:
-        return None, title, performer, "Ошибка скачивания: %s" % str(e)[:150]
-    files = [os.path.join(tmpdir, f) for f in os.listdir(tmpdir)]
-    if not files:
-        return None, title, performer, "Файл не скачался."
-    path = max(files, key=os.path.getsize)
-    if os.path.getsize(path) > SC_MAX_BYTES:
-        return None, title, performer, "Файл больше 50 МБ, Telegram не даст его отправить."
-    return path, title, performer, ""
-
-
-def sc_job(chat_id, url):
-    mid = None
-    try:
-        mid = send_msg(chat_id, "⏳ Проверяю трек...")
-        with tempfile.TemporaryDirectory() as tmp:
-            path, title, performer, err = sc_fetch(url, tmp)
-            if err:
-                text = "⚠️ " + err
-                if not (mid and edit_text(chat_id, mid, text)):
-                    send(chat_id, text)
-                return
-            if mid:
-                edit_text(chat_id, mid, "⬆️ Отправляю: %s" % title)
-            try:
-                multipart_send("sendAudio", "audio", chat_id, path,
-                               {"title": title[:64], "performer": performer[:64]})
-            except Exception as e:
-                logerr("sendAudio error: %s, пробую как документ" % e)
-                multipart_send("sendDocument", "document", chat_id, path)
-            if mid:
-                edit_text(chat_id, mid, "✅ Готово: %s" % title)
-    except Exception as e:
-        logerr("sc error: %s" % e)
-        send(chat_id, "⚠️ Не получилось отправить трек: %s" % str(e)[:150])
-    finally:
-        sc_busy.discard(chat_id)
-
-
-def start_sc(chat_id, url):
-    if chat_id in sc_busy:
-        send(chat_id, "Уже качаю трек, подожди.")
-        return
-    sc_busy.add(chat_id)
-    threading.Thread(target=sc_job, args=(chat_id, url), daemon=True).start()
-
-
 # ---------- админка ----------
 
 def fmt_uptime():
@@ -1017,10 +1091,10 @@ def admin_stats_text():
         day = sum(1 for u in users.values() if time.time() - u.get("last", 0) < 86400)
         return (
             "Статистика бота:\nПользователей: %d (за сутки: %d)\nПроверено: %d\nНайдено свободных: %d\n"
-            "Слежек: %d\nЗанятых в памяти: %d\nЗабанено: %d\nЗакрытый доступ: %s\nОбслуживание: %s\nРаботаю: %s" % (
+            "Слежек: %d\nЗанятых в памяти: %d\nЗабанено: %d\nЗакрытый доступ: %s\nОбслуживание: %s\nСкорость: пауза %.1f сек, лимитов t.me: %d\nРаботаю: %s" % (
                 len(users), day, st["checked"], st["found"], len(state["watches"]), len(taken),
                 len(state["banned"]), "вкл" if state["private"] else "выкл",
-                "вкл" if state["maintenance"] else "выкл", fmt_uptime()))
+                "вкл" if state["maintenance"] else "выкл", speed["delay"], speed["limits"], fmt_uptime()))
 
 
 def admin_users_text():
@@ -1079,12 +1153,6 @@ def admin_command(chat_id, cmd, parts, text):
         send(chat_id, "ID %d %s." % (uid, "заблокирован" if cmd == "/ban" else "разблокирован"))
     elif cmd == "/users":
         send(chat_id, admin_users_text())
-    elif cmd == "/sc":
-        m = SC_RE.search(text)
-        if m:
-            start_sc(chat_id, m.group(0))
-        else:
-            send(chat_id, "Напиши так: /sc https://soundcloud.com/... (или просто пришли ссылку).")
     elif cmd == "/rare":
         n = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else DEFAULT_N
         launch_rare(chat_id, max(1, min(n, MAX_N)))
@@ -1180,9 +1248,6 @@ def handle(msg):
 
     text = (msg.get("text") or "").strip()
     if not text.startswith("/"):
-        m = SC_RE.search(text)
-        if m and is_admin(chat_id):
-            start_sc(chat_id, m.group(0))
         return
     parts = text.split()
     cmd = parts[0].split("@")[0].lower()
@@ -1197,7 +1262,7 @@ def handle(msg):
         send(chat_id, maint_message())
         return
 
-    if cmd in ("/admin", "/broadcast", "/ban", "/unban", "/users", "/maintenance", "/rare", "/sc"):
+    if cmd in ("/admin", "/broadcast", "/ban", "/unban", "/users", "/maintenance", "/rare"):
         if is_admin(chat_id):
             admin_command(chat_id, cmd, parts, text)
         return
@@ -1217,7 +1282,19 @@ def handle(msg):
         if res is None:
             send(chat_id, "Не удалось проверить, попробуй позже.")
         else:
-            send(chat_id, "@%s - %s" % (name, "похоже свободен" if res else "занят"))
+            code, raw = fragment_status(name)
+            send(chat_id, "@%s - %s\n%s" % (name, "похоже свободен" if res else "занят", frag_text(name, code, raw)))
+    elif cmd in ("/fragment", "/fr"):
+        names = [w.lstrip("@").lower() for w in parts[1:6] if valid(w.lstrip("@").lower())]
+        if not names:
+            send(chat_id, "Напиши так: /fragment имя (можно до 5 имён через пробел)")
+            return
+        lines = []
+        for nm in names:
+            code, raw = fragment_status(nm)
+            lines.append("@%s\n%s" % (nm, frag_text(nm, code, raw)))
+            time.sleep(FRAG_DELAY)
+        send(chat_id, "\n\n".join(lines))
     elif cmd in ("/find", "/random"):
         length, n = parse_num_args(parts)
         launch(chat_id, "find" if cmd == "/find" else "rand", length, n)
