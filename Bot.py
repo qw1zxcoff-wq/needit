@@ -41,6 +41,11 @@ BACKOFF_MAX = 180      # максимум общей паузы (сек)
 SPEEDUP_AFTER = 20     # после стольких удачных проверок подряд бот чуть ускоряется
 LIMIT_STOP = 12        # сколько ответов-лимитов за один поиск терпим, потом останавливаем поиск
 FRAGMENT_CHECK = True  # проверять найденные юзы на Fragment (продаются ли они там)
+DC_URL = "https://discord.com/api/v9/unique-username/username-attempt-unauthed"  # неофициальный, может измениться
+DC_DELAY = 2.5         # пауза между проверками Discord (сек), Discord быстро режет частые запросы
+DC_DEFAULT_N = 15
+DC_MAX_N = 30
+DC_COOLDOWN = 20
 FRAG_MAX = 25          # сколько найденных юзов проверять на Fragment за один поиск
 FRAG_DELAY = 0.8       # пауза между запросами к Fragment (сек)
 WORKERS = 4            # потоков проверки
@@ -91,8 +96,10 @@ state = {
     "private": False,  # закрытый режим: только админ и ALLOWED
     "maintenance": False,  # режим обслуживания: всем, кроме админа, «технические работы»
     "maint_text": "",
+    "dc_taken": [],    # занятые юзы Discord (кэш)
 }
 taken = set()
+dc_taken = set()
 busy = set()
 last_run = {}
 last_job = {}      # chat_id -> (title, фабрика, n) для кнопки «Ещё»
@@ -133,7 +140,9 @@ ADMIN_HELP = (
     "/ban ID, /unban ID - блокировка\n"
     "/users - список пользователей\n"
     "/maintenance on|off [текст] - режим обслуживания\n"
-    "/rare [N] - поиск редких юзов (5 букв, без цифр и _, читаемые)"
+    "/rare [N] - поиск редких юзов (5 букв, без цифр и _, читаемые)\n"
+    "/discord 3|4 [N] [rand] - поиск свободных 3-4 буквенных юзов Discord (читаемые, или rand - любые)\n"
+    "/dccheck имя - проверить один юз Discord"
 )
 
 
@@ -156,6 +165,7 @@ def load_state():
                 if k in data:
                     state[k] = data[k]
             taken.update(state.get("taken", []))
+            dc_taken.update(state.get("dc_taken", []))
     except Exception:
         pass
 
@@ -169,6 +179,12 @@ def save_state():
                 taken.clear()
                 taken.update(lst)
             state["taken"] = lst
+            dl = list(dc_taken)
+            if len(dl) > MAX_TAKEN:
+                dl = dl[-MAX_TAKEN:]
+                dc_taken.clear()
+                dc_taken.update(dl)
+            state["dc_taken"] = dl
             raw = json.dumps(state, ensure_ascii=False)
         tmp = STATE_FILE + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
@@ -1077,6 +1093,179 @@ def note_conflict():
                     % (len(recent), CONFLICT_WINDOW // 60))
 
 
+# ---------- Discord (только админ) ----------
+# Используем публичную проверку из формы регистрации Discord (без токенов и входа в аккаунт).
+# Это неофициальный адрес: Discord может его изменить, потребовать капчу или ограничить запросы.
+# Поэтому проверки идут медленно, по одной, а при лимите бот сам замедляется.
+dc = {"delay": DC_DELAY, "until": 0.0, "limits": 0, "ok": 0, "last_err": ""}
+dc_lock = threading.Lock()
+dc_busy = set()
+dc_last_run = {}
+
+
+def dc_valid(name):
+    return bool(re.fullmatch(r"[a-z0-9_.]{2,32}", name)) and ".." not in name
+
+
+def dc_delay():
+    with dc_lock:
+        return dc["delay"] * random.uniform(0.9, 1.2)
+
+
+def dc_wait():
+    while True:
+        with dc_lock:
+            left = dc["until"] - time.time()
+        if left <= 0:
+            return
+        time.sleep(min(left, 2))
+
+
+def dc_limit(retry_after, reason):
+    with dc_lock:
+        dc["limits"] += 1
+        dc["ok"] = 0
+        dc["last_err"] = reason
+        dc["until"] = max(dc["until"], time.time() + min(max(retry_after, 1), 600))
+        dc["delay"] = min(dc["delay"] * 1.5, 15.0)
+    logerr("Discord: %s, пауза %d сек" % (reason, retry_after))
+
+
+def dc_ok():
+    with dc_lock:
+        dc["ok"] += 1
+        if dc["ok"] >= 10:
+            dc["ok"] = 0
+            dc["delay"] = max(DC_DELAY, dc["delay"] * 0.85)
+
+
+def dc_check(name):
+    """True = похоже свободен, False = занят, None = не удалось (лимит, капча, другой ответ)."""
+    dc_wait()
+    req = urllib.request.Request(
+        DC_URL, data=json.dumps({"username": name}).encode("utf-8"),
+        headers={"Content-Type": "application/json",
+                 "User-Agent": "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36"})
+    try:
+        with urllib.request.urlopen(req, timeout=12) as r:
+            body = json.loads(r.read().decode("utf-8", errors="ignore"))
+    except urllib.error.HTTPError as e:
+        try:
+            text = e.read().decode("utf-8", errors="ignore")
+        except Exception:
+            text = ""
+        if e.code == 429:
+            try:
+                retry = float(e.headers.get("Retry-After") or json.loads(text).get("retry_after") or 30)
+            except Exception:
+                retry = 30.0
+            dc_limit(int(retry) + 1, "лимит Discord (429)")
+        elif "captcha" in text.lower():
+            dc_limit(300, "Discord просит капчу")
+        else:
+            with dc_lock:
+                dc["last_err"] = "Discord ответил HTTP %d" % e.code
+        return None
+    except Exception as e:
+        with dc_lock:
+            dc["last_err"] = "нет связи с Discord: %s" % str(e)[:50]
+        return None
+    if isinstance(body, dict) and "taken" in body:
+        dc_ok()
+        return not bool(body["taken"])
+    with dc_lock:
+        dc["last_err"] = "Discord вернул неожиданный ответ (адрес мог измениться)"
+    return None
+
+
+def dc_scan(next_name, n, progress=None):
+    """Последовательная проверка. Возвращает (найдено, проверено, остановились_из_за_сбоев)."""
+    found, seen = [], set()
+    done = fails = attempts = 0
+    while done < n and fails < 4 and attempts < n * 30 + 100:
+        attempts += 1
+        name = next_name()
+        if name is None:
+            break
+        if name in seen or not dc_valid(name):
+            continue
+        seen.add(name)
+        with lock:
+            cached = name in dc_taken
+        if cached:
+            done += 1
+            continue
+        res = dc_check(name)
+        if res is None:
+            fails += 1
+            time.sleep(dc_delay())
+            continue
+        fails = 0
+        done += 1
+        if res:
+            found.append(name)
+        else:
+            with lock:
+                dc_taken.add(name)
+        if progress:
+            try:
+                progress(done, len(found))
+            except Exception:
+                pass
+        time.sleep(dc_delay())
+    return found, done, fails >= 4
+
+
+def dc_progress(title, done, n, found_cnt):
+    filled = int(10 * done / n) if n else 0
+    return "%s\n%s %d/%d\nНайдено: %d" % (title, "▓" * filled + "░" * (10 - filled), done, n, found_cnt)
+
+
+def dc_search(chat_id, length, n, mode):
+    try:
+        title = "Discord, %d буквы (%s)" % (length, "читаемые" if mode == "pretty" else "любые")
+        mid = send_msg(chat_id, dc_progress(title, 0, n, 0) + "\n(проверка медленная, чтобы Discord не заблокировал)")
+        last_edit = [time.time()]
+
+        def prog(done, found_cnt):
+            if mid and time.time() - last_edit[0] >= PROGRESS_EVERY:
+                last_edit[0] = time.time()
+                edit_text(chat_id, mid, dc_progress(title, done, n, found_cnt))
+
+        if mode == "pretty":
+            namer = lambda: gen_pretty(length)
+        else:
+            namer = lambda: gen_random(length, "letters")
+        found, done, stopped = dc_scan(namer, n, prog)
+        save_state()
+        if found:
+            text = "%s\nПроверено %d. Похоже свободны (%d):\n%s\n\nПроверь вручную: Discord -> Настройки -> Моя учётная запись -> Имя пользователя." % (
+                title, done, len(found), "\n".join(found))
+        else:
+            text = "%s\nПроверено %d, свободных не нашлось. Для 3-4 букв это обычное дело: почти все такие имена заняты." % (title, done)
+        if stopped:
+            with dc_lock:
+                reason = dc["last_err"] or "нет ответа"
+            text += "\n\n⚠️ Поиск остановлен: %s. Попробуй позже, бот сам замедлился." % reason
+        if not (mid and edit_text(chat_id, mid, text)):
+            send(chat_id, text)
+    finally:
+        dc_busy.discard(chat_id)
+
+
+def start_dc(chat_id, length, n, mode):
+    if chat_id in dc_busy:
+        send(chat_id, "Поиск Discord уже идёт, дождись результата.")
+        return
+    wait = DC_COOLDOWN - (time.time() - dc_last_run.get(chat_id, 0))
+    if wait > 0:
+        send(chat_id, "Подожди ещё %d сек." % int(wait))
+        return
+    dc_last_run[chat_id] = time.time()
+    dc_busy.add(chat_id)
+    threading.Thread(target=dc_search, args=(chat_id, length, n, mode), daemon=True).start()
+
+
 # ---------- админка ----------
 
 def fmt_uptime():
@@ -1153,6 +1342,31 @@ def admin_command(chat_id, cmd, parts, text):
         send(chat_id, "ID %d %s." % (uid, "заблокирован" if cmd == "/ban" else "разблокирован"))
     elif cmd == "/users":
         send(chat_id, admin_users_text())
+    elif cmd in ("/discord", "/dc"):
+        args = [a.lower() for a in parts[1:]]
+        if not args or args[0] not in ("3", "4"):
+            send(chat_id, "Напиши так: /discord 3 [N] [rand] или /discord 4 [N] [rand]\n"
+                          "N - сколько проверить (до %d), rand - любые сочетания, без него читаемые." % DC_MAX_N)
+            return
+        n = DC_DEFAULT_N
+        if len(args) > 1 and args[1].isdigit():
+            n = max(1, min(int(args[1]), DC_MAX_N))
+        start_dc(chat_id, int(args[0]), n, "rand" if "rand" in args[1:] else "pretty")
+    elif cmd == "/dccheck":
+        name = parts[1].lstrip("@").lower() if len(parts) > 1 else ""
+        if not dc_valid(name):
+            send(chat_id, "Напиши так: /dccheck имя (2-32 символа: a-z, 0-9, _ и .)")
+            return
+        res = dc_check(name)
+        if res is None:
+            with dc_lock:
+                reason = dc["last_err"] or "нет ответа"
+            send(chat_id, "Не удалось проверить: %s." % reason)
+        else:
+            if not res:
+                with lock:
+                    dc_taken.add(name)
+            send(chat_id, "Discord: %s - %s" % (name, "похоже свободен" if res else "занят"))
     elif cmd == "/rare":
         n = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else DEFAULT_N
         launch_rare(chat_id, max(1, min(n, MAX_N)))
@@ -1262,7 +1476,7 @@ def handle(msg):
         send(chat_id, maint_message())
         return
 
-    if cmd in ("/admin", "/broadcast", "/ban", "/unban", "/users", "/maintenance", "/rare"):
+    if cmd in ("/admin", "/broadcast", "/ban", "/unban", "/users", "/maintenance", "/rare", "/discord", "/dc", "/dccheck"):
         if is_admin(chat_id):
             admin_command(chat_id, cmd, parts, text)
         return
